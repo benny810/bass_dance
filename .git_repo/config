@@ -1,0 +1,9 @@
+[core]
+	repositoryformatversion = 0
+	filemode = true
+	bare = false
+	logallrefupdates = true
+	worktree = /home/project/bass_dance
+[user]
+	name = benny810
+	email = bennyhu810@gmail.com
