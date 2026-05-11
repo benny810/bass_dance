@@ -114,10 +114,10 @@ pip install mido numpy scipy mujoco matplotlib
 
 ```bash
 # 基本用法
-python -m midi_to_dance.main mid/yellow贝斯.mid -o csv/output.csv
+python -m midi_to_dance.main mid/yellow_bass.mid -o csv/output.csv
 
 # 完整选项
-python -m midi_to_dance.main mid/yellow贝斯.mid \
+python -m midi_to_dance.main mid/yellow_bass.mid \
     -o csv/output.csv \
     --dt 0.02 \      # 采样周期 (默认 0.02s = 50Hz)
     --scale 0.8 \    # 动作幅度缩放 (默认 1.0)
@@ -128,14 +128,27 @@ python -m midi_to_dance.main mid/yellow贝斯.mid \
 ### MuJoCo 可视化仿真
 
 ```bash
-# 基本用法 (同步播放 MIDI 音频)
-python -m midi_to_dance.simulate csv/output.csv mid/yellow贝斯.mid
+# 运动学仿真（默认）：直接设定关节角度，零延迟
+python -m midi_to_dance.simulate csv/output.csv mid/yellow_bass.mid
+
+# 动力学仿真：通过 PD 位置执行器驱动关节，含物理解算
+python -m midi_to_dance.simulate csv/output.csv mid/yellow_bass.mid --dynamics
 
 # 选项
-python -m midi_to_dance.simulate csv/output.csv mid/yellow贝斯.mid \
+python -m midi_to_dance.simulate csv/output.csv mid/yellow_bass.mid \
     --slow 0.5 \     # 半速播放
-    --no-audio       # 禁用音频
+    --no-audio \     # 禁用音频
+    --fps 50 \       # CSV 无时间戳列时指定帧率 (默认 50)
+    --dynamics       # 动力学模式 (默认运动学)
 ```
+
+**仿真模式**：
+- **运动学 (kinematic)**：每帧直接设置 `qpos` + `mj_forward`，无延迟，适合预览轨迹
+- **动力学 (dynamics)**：27 个 position 执行器 (`kp=60, kv=4` 腿 / `kp=40, kv=3` 臂腰) + `mj_step`，含重力、接触力等物理效应
+
+**场景**：
+- 大棋盘格地面 (`texrepeat="10 10"`)，位于脚底高度 (z = -0.8834)
+- 机器人 `base_link` 为浮动基座 (`<freejoint/>`)，可整体平移旋转
 
 **仿真交互**：
 - 鼠标拖拽：旋转视角
@@ -158,28 +171,36 @@ timestamp,left_leg_pelvic_pitch,...,left_shoulder_pitch,...,right_wrist_roll
 - 左臂 7 关节：shoulder pitch/roll/yaw, elbow, wrist yaw/pitch/roll
 - 右臂 7 关节：同上
 
+模拟器同时兼容多种 CSV 格式：
+- 带/不带 `timestamp` 列
+- 列名后缀 `_pos`、`_joint` 或无后缀
+- 含 `_vel` 列自动跳过
+
 ## 项目结构
 
 ```
 midi_to_dance/
 ├── __init__.py
-├── midi_parser.py           # mido 解析 MIDI → NoteEvent/MidiData
+├── midi_parser.py           # mido 解析 MIDI → NoteEvent/MidiData（全轨道扫描）
 ├── feature_extractor.py     # 音乐特征提取
 ├── motion_primitives.py     # 4 种舞蹈基元
 ├── trajectory_generator.py  # 基元叠加 + 关节限位 + 平滑 + 中性姿态
 ├── trajectory_writer.py     # CSV 输出
 ├── main.py                  # CLI 入口 + matplotlib 可视化
-└── simulate.py              # MuJoCo 仿真 + MIDI 音频合成播放
+└── simulate.py              # MuJoCo 仿真（运动学/动力学）+ MIDI 音频合成播放
 
 csv/
 ├── output.csv               # 生成的轨迹
+├── yellow_bass.csv          # 外部动捕数据 (含 pos/vel 等扩展列)
 └── example.csv              # 参考动捕数据 (提供手臂姿态)
 
 mid/
-└── yellow贝斯.mid           # 示例 MIDI 文件
+└── yellow_bass.mid          # 示例 MIDI 文件
 
-casbot_band_urdf/urdf/
-└── CASBOT02_ENCOS_7dof_shell_20251015_P1L_bass.urdf  # 机器人模型
+casbot_band_urdf/
+├── meshes/                  # STL 模型网格
+├── urdf/                    # URDF 机器人定义
+└── xml/                     # MJCF 机器人场景定义
 ```
 
 ## 自定义

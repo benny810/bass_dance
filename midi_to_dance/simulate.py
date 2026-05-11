@@ -4,6 +4,7 @@
 Usage:
     python midi_to_dance/simulate.py output.csv mid/yellow贝斯.mid
     python midi_to_dance/simulate.py output.csv mid/yellow贝斯.mid --slow 0.5
+    python midi_to_dance/simulate.py output.csv mid/yellow贝斯.mid --dynamics
 """
 
 import argparse
@@ -16,16 +17,32 @@ import mujoco
 import mujoco.viewer
 
 
-def load_trajectory(csv_path: str):
-    """Load CSV trajectory into (timestamps, joint_data dict, header)."""
-    with open(csv_path) as f:
+def load_trajectory(csv_path: str, fps: float = 50.0):
+    """Load CSV trajectory into (timestamps, joint_data dict, joint_names).
+
+    Handles two formats:
+    - With timestamp column: "timestamp, joint_1, ..."
+    - Without: "joint_1, joint_2, ..." — generates synthetic timestamps at `fps`.
+    """
+    with open(csv_path, encoding="utf-8-sig") as f:
         header = f.readline().strip().split(",")
     data = np.loadtxt(csv_path, delimiter=",", skiprows=1)
-    timestamps = data[:, 0]
+
+    has_timestamp = header[0].strip() == "timestamp"
+    if has_timestamp:
+        timestamps = data[:, 0]
+        joint_names = header[1:]
+        joint_offset = 1
+    else:
+        dt = 1.0 / fps
+        timestamps = np.arange(len(data)) * dt
+        joint_names = header
+        joint_offset = 0
+
     joint_data = {}
-    for i, name in enumerate(header[1:]):
-        joint_data[name] = data[:, i + 1]
-    return timestamps, joint_data, header[1:]
+    for i, name in enumerate(joint_names):
+        joint_data[name] = data[:, i + joint_offset]
+    return timestamps, joint_data, joint_names
 
 
 def synthesize_midi_audio(midi_path: str, sample_rate: int = 44100):
@@ -39,25 +56,26 @@ def synthesize_midi_audio(midi_path: str, sample_rate: int = 44100):
     mid = mido.MidiFile(midi_path)
     ticks_per_beat = mid.ticks_per_beat
 
-    # Extract tempo map and notes
-    abs_tick = 0
+    # Extract tempo map and notes from all tracks
     tempo = 500000  # default 120 BPM
     tempo_map = [(0, tempo)]
+    notes = []  # (start_tick, end_sec, midi_note, velocity)
 
-    notes = []  # (start_sec, end_sec, midi_note, velocity)
-    active = {}
-
-    for msg in mid.tracks[0]:
-        abs_tick += msg.time
-        if msg.type == "set_tempo":
-            tempo = msg.tempo
-            tempo_map.append((abs_tick, tempo))
-        elif msg.type == "note_on" and msg.velocity > 0:
-            active[msg.note] = (abs_tick, msg.velocity)
-        elif msg.type == "note_off" or (msg.type == "note_on" and msg.velocity == 0):
-            if msg.note in active:
-                start_tick, vel = active.pop(msg.note)
-                notes.append((start_tick, abs_tick, msg.note, vel))
+    # Track 0 typically contains tempo meta-events; subsequent tracks hold notes
+    for track in mid.tracks:
+        abs_tick = 0
+        active = {}
+        for msg in track:
+            abs_tick += msg.time
+            if msg.type == "set_tempo":
+                tempo = msg.tempo
+                tempo_map.append((abs_tick, tempo))
+            elif msg.type == "note_on" and msg.velocity > 0:
+                active[msg.note] = (abs_tick, msg.velocity)
+            elif msg.type == "note_off" or (msg.type == "note_on" and msg.velocity == 0):
+                if msg.note in active:
+                    start_tick, vel = active.pop(msg.note)
+                    notes.append((start_tick, abs_tick, msg.note, vel))
 
     # Convert ticks to seconds using tempo map
     def ticks_to_seconds(tick):
@@ -142,12 +160,22 @@ def main():
                         help="Playback speed factor (default: 1.0)")
     parser.add_argument("--no-audio", action="store_true",
                         help="Disable audio playback")
+    parser.add_argument("--fps", type=float, default=50.0,
+                        help="Frames per second for CSV without timestamp column (default: 50)")
+    parser.add_argument("--dynamics", action="store_true",
+                        help="Run physics dynamics simulation (default: kinematic)")
     args = parser.parse_args()
 
     # Load trajectory
     print(f"Loading trajectory: {args.csv_file}")
-    timestamps, joint_data, csv_joint_names = load_trajectory(args.csv_file)
+    timestamps, joint_data, csv_joint_names = load_trajectory(args.csv_file, fps=args.fps)
+    if len(timestamps) < 2:
+        print("Error: trajectory needs at least 2 frames")
+        sys.exit(1)
     dt_traj = timestamps[1] - timestamps[0]
+    if dt_traj <= 0:
+        print(f"Error: trajectory dt must be positive, got {dt_traj}")
+        sys.exit(1)
     print(f"  {len(timestamps)} frames, dt={dt_traj:.3f}s, duration={timestamps[-1]:.1f}s")
 
     # Synthesize audio
@@ -158,27 +186,150 @@ def main():
         audio, sample_rate, audio_duration = synthesize_midi_audio(args.midi_file)
         print(f"  {audio_duration:.1f}s audio, {sample_rate} Hz")
 
-    # Load MuJoCo model
-    urdf_path = Path(__file__).parent.parent / "casbot_band_urdf" / "urdf" / \
-                "CASBOT02_ENCOS_7dof_shell_20251015_P1L_bass.urdf"
-    print(f"Loading URDF: {urdf_path}")
-    model = mujoco.MjModel.from_xml_path(str(urdf_path))
+    # Build scene XML with floating base_link, checkerboard floor, and position actuators.
+    # The robot XML is embedded inline so we can wrap its bodies in a free-floating base_link.
+    import re
+
+    xml_dir = Path(__file__).parent.parent / "casbot_band_urdf" / "xml"
+    robot_xml_path = xml_dir / "CASBOT02_ENCOS_7dof_shell_20251015_P1L_bass.xml"
+    robot_content = robot_xml_path.read_text()
+
+    # Extract inner content from robot XML (<mujoco> wrapper -> inner content)
+    inner = re.search(r"<mujoco[^>]*>(.*)</mujoco>", robot_content, re.DOTALL)
+    if not inner:
+        print("Error: could not parse robot XML")
+        sys.exit(1)
+    inner_content = inner.group(1)
+
+    # Strip sections we override ourselves
+    inner_content = re.sub(r'\s*<compiler[^/]*/>\s*', '\n', inner_content)
+    inner_content = re.sub(r'\s*<actuator>.*?</actuator>\s*', '\n', inner_content, flags=re.DOTALL)
+    inner_content = re.sub(r'\s*<sensor>.*?</sensor>\s*', '\n', inner_content, flags=re.DOTALL)
+    inner_content = re.sub(r'\s*<equality>.*?</equality>\s*', '\n', inner_content, flags=re.DOTALL)
+    inner_content = re.sub(r'\s*<visual>.*?</visual>\s*', '\n', inner_content, flags=re.DOTALL)
+    inner_content = re.sub(r'<camera[^/]*/>', '', inner_content)
+    inner_content = re.sub(r'<body name="external_camera_body".*?</body>', '', inner_content, flags=re.DOTALL)
+    inner_content = re.sub(r'<body name="target_marker_body".*?</body>', '', inner_content, flags=re.DOTALL)
+
+    # Wrap all worldbody children in a floating base_link body
+    inner_content = inner_content.replace(
+        '<worldbody>',
+        '<worldbody><body name="base_link" pos="0 0 0.8834"><freejoint/>'
+    )
+    inner_content = inner_content.replace(
+        '</worldbody>',
+        '</body></worldbody>'
+    )
+
+    # Position actuators for all 27 controlled joints
+    _leg_joints = ["leg_pelvic_pitch", "leg_pelvic_roll", "leg_pelvic_yaw",
+                   "leg_knee_pitch", "leg_ankle_pitch", "leg_ankle_roll"]
+    _arm_joints = ["shoulder_pitch", "shoulder_roll", "shoulder_yaw",
+                   "elbow_pitch", "wrist_yaw", "wrist_pitch", "wrist_roll"]
+    _act_lines = []
+    for side in ["left", "right"]:
+        for j in _leg_joints:
+            _act_lines.append(f'    <position name="{side}_{j}_joint" joint="{side}_{j}_joint" kp="60" kv="4"/>')
+    _act_lines.append('    <position name="waist_yaw_joint" joint="waist_yaw_joint" kp="40" kv="3"/>')
+    for side in ["left", "right"]:
+        for j in _arm_joints:
+            _act_lines.append(f'    <position name="{side}_{j}_joint" joint="{side}_{j}_joint" kp="40" kv="3"/>')
+
+    mesh_abs = str((xml_dir.parent / "meshes").resolve())
+
+    scene_xml = f"""<mujoco model="scene">
+  <compiler angle="radian" meshdir="{mesh_abs}" texturedir="{mesh_abs}" autolimits="true"/>
+
+  <asset>
+    <texture name="checker_tex" type="2d" builtin="checker" width="512" height="512"
+             rgb1="0.15 0.15 0.15" rgb2="0.85 0.85 0.85"/>
+    <material name="checker_mat" texture="checker_tex" texrepeat="10 10" reflectance="0.05"/>
+  </asset>
+
+  {inner_content}
+
+  <actuator>
+{chr(10).join(_act_lines)}
+  </actuator>
+
+  <worldbody>
+    <body pos="0 0 -0.8834">
+      <geom name="floor" type="plane" material="checker_mat" size="0 0 1"/>
+    </body>
+    <light pos="5 5 4" dir="-1 -1 -1" diffuse="0.8 0.8 0.8"/>
+  </worldbody>
+</mujoco>"""
+
+    scene_path = xml_dir / "_scene_checker.xml"
+    scene_path.write_text(scene_xml)
+    try:
+        model = mujoco.MjModel.from_xml_path(str(scene_path))
+    finally:
+        scene_path.unlink(missing_ok=True)
+    print(f"Loaded model: {model.njnt} joints, {model.nq} DOFs, {model.nu} actuators")
+
     data = mujoco.MjData(model)
 
     # Build joint mapping: CSV column name -> MuJoCo qpos index
     qpos_map = {}  # csv_name -> qpos_index
+    ctrl_map = {}  # csv_name -> actuator_index (for dynamics mode)
+
+    # Pre-build joint-id -> actuator-index lookup
+    joint_to_actuator = {}
+    for aid in range(model.nu):
+        jid = int(model.actuator_trnid[aid][0])
+        if jid >= 0:
+            joint_to_actuator[jid] = aid
+
+    skipped = 0
     for csv_name in csv_joint_names:
-        joint_name = csv_name + "_joint"
+        # Map CSV column name to MuJoCo joint name
+        if csv_name.endswith("_pos"):
+            joint_name = csv_name[:-4]  # strip _pos suffix
+        elif csv_name.endswith("_vel"):
+            skipped += 1
+            continue
+        elif csv_name.endswith("_joint"):
+            joint_name = csv_name
+        else:
+            joint_name = csv_name + "_joint"  # legacy format from trajectory_writer
+
         jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
+        if jid < 0:
+            skipped += 1
+            continue
         qposadr = model.jnt_qposadr[jid]
         qpos_map[csv_name] = qposadr
-    print(f"  Mapped {len(qpos_map)} joints")
+
+        # Map to actuator for dynamics mode
+        if jid in joint_to_actuator:
+            ctrl_map[csv_name] = joint_to_actuator[jid]
+    print(f"  Mapped {len(qpos_map)} joints ({skipped} columns skipped)")
+    if args.dynamics:
+        print(f"  Dynamics mode: {len(ctrl_map)} joints with actuators")
 
     # Pre-compute full qpos array for each frame
     n_frames = len(timestamps)
     qpos_sequence = np.tile(model.qpos0.copy(), (n_frames, 1))
     for csv_name, qpos_idx in qpos_map.items():
         qpos_sequence[:, qpos_idx] = joint_data[csv_name]
+
+    # In kinematic mode, pre-compute base_link z so both feet stay on the floor.
+    if not args.dynamics:
+        FLOOR_Z = -0.8834
+        left_ankle_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY,
+                                          "left_leg_ankle_roll_link")
+        right_ankle_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY,
+                                           "right_leg_ankle_roll_link")
+        print("  Computing foot-ground constraints...")
+        for frame in range(n_frames):
+            data.qpos[:] = qpos_sequence[frame]
+            mujoco.mj_kinematics(model, data)
+
+            # Adjust base z so the lower foot touches the floor
+            dz = FLOOR_Z - min(data.xpos[left_ankle_id][2],
+                               data.xpos[right_ankle_id][2])
+            qpos_sequence[frame, 2] += dz
 
     # Audio playback via aplay/paplay
     audio_proc = None
@@ -220,9 +371,13 @@ def main():
             time.sleep(0.1)  # Let audio player buffer
 
     # MuJoCo viewer
-    print("\nStarting simulation...")
+    mode_label = "dynamics" if args.dynamics else "kinematic"
+    print(f"\nStarting simulation ({mode_label})...")
     print("  Controls: drag mouse to rotate, scroll to zoom, Esc to quit")
-    print("  Sync: audio and motion start together")
+
+    if args.dynamics:
+        n_substeps = max(1, round(dt_traj / model.opt.timestep))
+        print(f"  Physics: {n_substeps} substeps/frame (timestep={model.opt.timestep:.4f}s)")
 
     sim_start_time = time.time()
     if audio_proc is None:
@@ -233,8 +388,8 @@ def main():
 
     with mujoco.viewer.launch_passive(model, data) as viewer:
         viewer.cam.distance = 3.0
-        viewer.cam.elevation = -5
-        viewer.cam.lookat = [0, 0, 0.8]
+        viewer.cam.elevation = -10
+        viewer.cam.lookat = [0, 0, -0.2]
 
         last_frame = -1
         while viewer.is_running():
@@ -242,8 +397,17 @@ def main():
             frame = min(int(elapsed / dt_traj), n_frames - 1)
 
             if frame != last_frame:
-                data.qpos[:] = qpos_sequence[frame]
-                mujoco.mj_forward(model, data)
+                if args.dynamics:
+                    # Set position targets for all controlled joints
+                    for csv_name, aid in ctrl_map.items():
+                        data.ctrl[aid] = joint_data[csv_name][frame]
+                    # Step physics
+                    for _ in range(n_substeps):
+                        mujoco.mj_step(model, data)
+                else:
+                    # Kinematic: set joint positions + enforce foot-ground contact
+                    data.qpos[:] = qpos_sequence[frame]
+                    mujoco.mj_forward(model, data)
                 last_frame = frame
 
             viewer.sync()

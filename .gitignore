@@ -23,7 +23,7 @@ Thumbs.db
 
 # Generated outputs
 csv/output.csv
-csv/*.csv
+# csv/*.csv
 dance_trajectory.png
 
 # Claude

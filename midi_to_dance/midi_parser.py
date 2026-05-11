@@ -39,20 +39,21 @@ def parse_midi(filepath: str) -> MidiData:
     bpm = 120.0
     time_sig = (4, 4)
 
-    abs_tick = 0
     tempo_at_tick = [(0, 500000)]  # (tick, microseconds per beat)
 
     raw_events = []  # (tick, type, note, velocity)
-    for msg in mid.tracks[0]:
-        abs_tick += msg.time
-        if msg.type == "set_tempo":
-            tempo_at_tick.append((abs_tick, msg.tempo))
-        elif msg.type == "time_signature":
-            time_sig = (msg.numerator, msg.denominator)
-        elif msg.type == "note_on" and msg.velocity > 0:
-            raw_events.append((abs_tick, "on", msg.note, msg.velocity))
-        elif msg.type == "note_off" or (msg.type == "note_on" and msg.velocity == 0):
-            raw_events.append((abs_tick, "off", msg.note, 0))
+    for track in mid.tracks:
+        abs_tick = 0
+        for msg in track:
+            abs_tick += msg.time
+            if msg.type == "set_tempo":
+                tempo_at_tick.append((abs_tick, msg.tempo))
+            elif msg.type == "time_signature":
+                time_sig = (msg.numerator, msg.denominator)
+            elif msg.type == "note_on" and msg.velocity > 0:
+                raw_events.append((abs_tick, "on", msg.note, msg.velocity))
+            elif msg.type == "note_off" or (msg.type == "note_on" and msg.velocity == 0):
+                raw_events.append((abs_tick, "off", msg.note, 0))
 
     # Use the most common tempo
     if len(tempo_at_tick) > 1:
