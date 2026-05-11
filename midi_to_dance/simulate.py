@@ -314,21 +314,98 @@ def main():
     for csv_name, qpos_idx in qpos_map.items():
         qpos_sequence[:, qpos_idx] = joint_data[csv_name]
 
-    # In kinematic mode, pre-compute base_link z so both feet stay on the floor.
+    # In kinematic mode, pre-compute base_link z and ankle angles so both feet
+    # stay flat on the floor.
     if not args.dynamics:
+        import struct
+
         FLOOR_Z = -0.8834
         left_ankle_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY,
                                           "left_leg_ankle_roll_link")
         right_ankle_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY,
                                            "right_leg_ankle_roll_link")
-        print("  Computing foot-ground constraints...")
+
+        # Ankle pitch/roll joint qpos indices and parent body IDs for foot flattening
+        ankle_pitch_qpos = {}
+        ankle_roll_qpos = {}
+        ankle_pitch_parent = {}  # parent body of ankle_pitch_link
+        ankle_pitch_range = {}
+        ankle_roll_range = {}
+
+        for side in ["left", "right"]:
+            ap_body = f"{side}_leg_ankle_pitch_link"
+            ar_body = f"{side}_leg_ankle_roll_link"
+            ap_joint = f"{side}_leg_ankle_pitch_joint"
+            ar_joint = f"{side}_leg_ankle_roll_joint"
+
+            ap_jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, ap_joint)
+            ar_jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, ar_joint)
+            ankle_pitch_qpos[side] = model.jnt_qposadr[ap_jid]
+            ankle_roll_qpos[side] = model.jnt_qposadr[ar_jid]
+            ankle_pitch_range[side] = model.jnt_range[ap_jid]
+            ankle_roll_range[side] = model.jnt_range[ar_jid]
+
+            ap_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, ap_body)
+            ankle_pitch_parent[side] = model.body_parentid[ap_body_id]
+
+        # Load foot mesh vertices (local frame relative to ankle_roll_link body)
+        mesh_dir = Path(__file__).parent.parent / "casbot_band_urdf" / "meshes"
+        foot_verts = {}  # side -> (N, 3) float32 array
+
+        for side in ["left", "right"]:
+            stl_path = mesh_dir / f"{side}_leg_ankle_roll_link.STL"
+            verts = []
+            with open(stl_path, "rb") as f:
+                f.seek(80)
+                n_tris = struct.unpack("<I", f.read(4))[0]
+                for _ in range(n_tris):
+                    f.read(12)  # normal
+                    verts.append(struct.unpack("<3f", f.read(12)))
+                    verts.append(struct.unpack("<3f", f.read(12)))
+                    verts.append(struct.unpack("<3f", f.read(12)))
+                    f.read(2)  # attribute
+            foot_verts[side] = np.unique(np.array(verts, dtype=np.float32), axis=0)
+
+        print(f"  Computing foot-ground constraints "
+              f"(left: {len(foot_verts['left'])} verts, right: {len(foot_verts['right'])} verts)...")
+
         for frame in range(n_frames):
             data.qpos[:] = qpos_sequence[frame]
             mujoco.mj_kinematics(model, data)
 
-            # Adjust base z so the lower foot touches the floor
-            dz = FLOOR_Z - min(data.xpos[left_ankle_id][2],
-                               data.xpos[right_ankle_id][2])
+            # Flatten both feet: solve for ankle_pitch / ankle_roll so the
+            # ankle_roll_link body +Z axis points straight up (world [0,0,1]).
+            # The foot mesh in body frame has sole at z=-0.0648, top at z=+0.0125,
+            # so +Z points from ankle center upward through the foot.
+            # Kinematic chain: R_world = R_knee * R_y(pitch) * R_x(roll)
+            # Closed form: pitch = atan2(z_k[0], z_k[2]), roll = asin(-z_k[1])
+            # where z_k is row 3 of the knee_pitch_link body xmat.
+            for side in ["left", "right"]:
+                z_k = data.xmat[ankle_pitch_parent[side]][6:9]
+                new_roll = np.arcsin(np.clip(-z_k[1], -1.0, 1.0))
+                new_pitch = np.arctan2(z_k[0], z_k[2])
+
+                # Clamp to joint limits
+                new_pitch = np.clip(new_pitch, *ankle_pitch_range[side])
+                new_roll = np.clip(new_roll, *ankle_roll_range[side])
+
+                data.qpos[ankle_pitch_qpos[side]] = new_pitch
+                data.qpos[ankle_roll_qpos[side]] = new_roll
+                qpos_sequence[frame, ankle_pitch_qpos[side]] = new_pitch
+                qpos_sequence[frame, ankle_roll_qpos[side]] = new_roll
+
+            # Re-run kinematics with flattened feet
+            mujoco.mj_kinematics(model, data)
+
+            # Transform foot mesh vertices to world frame, find lowest z
+            foot_min_z = float("inf")
+            for side, body_id in [("left", left_ankle_id), ("right", right_ankle_id)]:
+                xpos = data.xpos[body_id]
+                z_row = data.xmat[body_id][6:9]
+                world_z = xpos[2] + foot_verts[side] @ z_row
+                foot_min_z = min(foot_min_z, world_z.min())
+
+            dz = FLOOR_Z - float(foot_min_z)
             qpos_sequence[frame, 2] += dz
 
     # Audio playback via aplay/paplay
