@@ -51,6 +51,24 @@ def _apply_base_rotation(qpos, delta_pitch, delta_roll):
     qpos[3:7] = q_new
 
 
+def _rotate2d(v, theta):
+    """Rotate 2D vector(s) by theta.  v can be (2,) or (N,2)."""
+    c = np.cos(theta)
+    s = np.sin(theta)
+    return np.array([c * v[..., 0] - s * v[..., 1],
+                     s * v[..., 0] + c * v[..., 1]]).T
+
+
+def _apply_base_yaw(qpos, delta_yaw):
+    """Rotate the base_link quaternion around world Z by delta_yaw."""
+    cy = np.cos(delta_yaw / 2.0)
+    sy = np.sin(delta_yaw / 2.0)
+    q_yaw = np.array([cy, 0.0, 0.0, sy])
+    q_new = _quat_multiply(q_yaw, qpos[3:7])
+    q_new /= np.linalg.norm(q_new)
+    qpos[3:7] = q_new
+
+
 # ---------------------------------------------------------------------------
 # ZMP / CoM balance helpers
 # ---------------------------------------------------------------------------
@@ -477,17 +495,42 @@ def main():
                     f.read(2)  # attribute
             foot_verts[side] = np.unique(np.array(verts, dtype=np.float32), axis=0)
 
-        print(f"  Computing foot-ground constraints + ZMP balance "
+        print(f"  Computing foot-ground constraints + hip foot-lock "
               f"(left: {len(foot_verts['left'])} verts, right: {len(foot_verts['right'])} verts)...")
+
+        # Pre-resolve hip joint qpos indices for both feet
+        left_hip_qidxs = []
+        right_hip_qidxs = []
+        for side, store in [("left", left_hip_qidxs), ("right", right_hip_qidxs)]:
+            for jn in ["pelvic_pitch", "pelvic_roll", "pelvic_yaw"]:
+                jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT,
+                                        f"{side}_leg_{jn}_joint")
+                store.append(model.jnt_qposadr[jid])
+
+        # Carry over base pose from the previous frame so the IK doesn't
+        # have to fight a qpos0 reset every frame.
+        prev_qpos_base = model.qpos0.copy()  # [x, y, z, qw, qx, qy, qz, ...]
+
+        prev_left_xy = None
+        prev_right_xy = None
 
         for frame in range(n_frames):
             data.qpos[:] = qpos_sequence[frame]
+            # Overwrite the first 7 entries (freejoint: x,y,z,qw,qx,qy,qz)
+            # with the previous frame's converged base pose.
+            data.qpos[:7] = prev_qpos_base[:7]
 
-            # Iterative IK: foot-flattening, Z-contact, and CoM balance
-            for _iter in range(20):
+            if prev_left_xy is None:
+                mujoco.mj_kinematics(model, data)
+                prev_left_xy = data.xpos[left_ankle_id][:2].copy()
+                prev_right_xy = data.xpos[right_ankle_id][:2].copy()
+
+            # -- Phase 1: converge foot flattening + ground contact
+            #    (no hip adjustment yet, so these two don't fight each other)
+            for _iter in range(10):
                 mujoco.mj_kinematics(model, data)
 
-                # -- 1. Foot flattening: ankle pitch/roll so foot +Z points up --
+                # Foot flattening
                 for side in ["left", "right"]:
                     z_k = data.xmat[ankle_pitch_parent[side]][6:9]
                     new_roll = np.arcsin(np.clip(-z_k[1], -1.0, 1.0))
@@ -499,7 +542,7 @@ def main():
 
                 mujoco.mj_kinematics(model, data)
 
-                # -- 2. Foot-ground contact: base Z so lowest foot vertex touches floor --
+                # Foot-ground contact: base Z
                 foot_min_z = float("inf")
                 for side, body_id in [("left", left_ankle_id), ("right", right_ankle_id)]:
                     xpos = data.xpos[body_id]
@@ -508,34 +551,66 @@ def main():
                     foot_min_z = min(foot_min_z, world_z.min())
                 data.qpos[2] += FLOOR_Z - float(foot_min_z)
 
+            # -- Phase 2: hip foot-lock (after feet are flat & on ground) --
+            #    One damped least-squares step per foot.  Kinematics are
+            #    refreshed after *every* qpos change to avoid stale Jacobian
+            #    entries and to capture left↔right cross-coupling through
+            #    the pelvis.
+            eps_jac = 0.001   # finite-difference perturbation
+            lam_ik = 0.005    # damping
+            lr_ik = 0.4       # step size
+
+            for _iter in range(20):
+                # -- Left foot --
                 mujoco.mj_kinematics(model, data)
+                cur_l = data.xpos[left_ankle_id][:2].copy()
+                err_l = prev_left_xy - cur_l
+                if np.dot(err_l, err_l) >= 0.001 ** 2:
+                    Jl = np.zeros((2, 3))
+                    for j, qidx in enumerate(left_hip_qidxs):
+                        orig = data.qpos[qidx]
+                        data.qpos[qidx] = orig + eps_jac
+                        mujoco.mj_kinematics(model, data)
+                        Jl[:, j] = (data.xpos[left_ankle_id][:2] - cur_l) / eps_jac
+                        data.qpos[qidx] = orig
+                        mujoco.mj_kinematics(model, data)  # restore
+                    JJt = Jl @ Jl.T + lam_ik * lam_ik * np.eye(2)
+                    dq_l = np.clip(Jl.T @ np.linalg.solve(JJt, err_l) * lr_ik, -0.04, 0.04)
+                    for j, qidx in enumerate(left_hip_qidxs):
+                        data.qpos[qidx] += dq_l[j]
 
-                # -- 3. ZMP / CoM balance: pitch only of the floating base --
-                # Roll is intentionally NOT adjusted here — rotating the base
-                # around X would slide the feet laterally.  Lateral balance is
-                # handled by ankle-roll compensation in the sway primitive.
-                com = _compute_robot_com(model, data)
-                support_center = _compute_support_center(
-                    data, left_ankle_id, right_ankle_id,
-                )
-                com_error_x = support_center[0] - com[0]  # desired - actual
+                # -- Right foot --
+                mujoco.mj_kinematics(model, data)
+                cur_r = data.xpos[right_ankle_id][:2].copy()
+                err_r = prev_right_xy - cur_r
+                if np.dot(err_r, err_r) >= 0.001 ** 2:
+                    Jr = np.zeros((2, 3))
+                    for j, qidx in enumerate(right_hip_qidxs):
+                        orig = data.qpos[qidx]
+                        data.qpos[qidx] = orig + eps_jac
+                        mujoco.mj_kinematics(model, data)
+                        Jr[:, j] = (data.xpos[right_ankle_id][:2] - cur_r) / eps_jac
+                        data.qpos[qidx] = orig
+                        mujoco.mj_kinematics(model, data)  # restore
+                    JJt = Jr @ Jr.T + lam_ik * lam_ik * np.eye(2)
+                    dq_r = np.clip(Jr.T @ np.linalg.solve(JJt, err_r) * lr_ik, -0.04, 0.04)
+                    for j, qidx in enumerate(right_hip_qidxs):
+                        data.qpos[qidx] += dq_r[j]
 
-                if abs(com_error_x) < 0.003:
+                # Check convergence
+                mujoco.mj_kinematics(model, data)
+                le = np.linalg.norm(prev_left_xy - data.xpos[left_ankle_id][:2])
+                re = np.linalg.norm(prev_right_xy - data.xpos[right_ankle_id][:2])
+                if le < 0.001 and re < 0.001:
                     break
 
-                com_height = max(com[2] - FLOOR_Z, 0.1)
-                gain = 0.35
-                delta_pitch = np.clip(com_error_x / com_height * gain, -0.06, 0.06)
-                _apply_base_rotation(data.qpos, delta_pitch, 0.0)
-
-            # -- 4. XY anchor: cancel any foot drift so feet stay planted --
+            # Update tracked positions for next frame
             mujoco.mj_kinematics(model, data)
-            sc = _compute_support_center(data, left_ankle_id, right_ankle_id)
-            data.qpos[0] -= sc[0]
-            data.qpos[1] -= sc[1]
+            prev_left_xy = data.xpos[left_ankle_id][:2].copy()
+            prev_right_xy = data.xpos[right_ankle_id][:2].copy()
 
-            # Save balanced pose back to the sequence
             qpos_sequence[frame] = data.qpos.copy()
+            prev_qpos_base = data.qpos.copy()  # carry base + joints to next frame
 
             # Progress indicator
             if (frame + 1) % 1000 == 0 or frame == n_frames - 1:
