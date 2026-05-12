@@ -107,12 +107,14 @@ def generate_sway(
     sway = np.clip(sway, -amplitude * 2, amplitude * 2)
 
     result = {}
-    # Right leg: positive sway -> right pelvic_roll increases
-    result["right_leg_pelvic_roll"] = np.clip(sway, 0, None)
-    result["left_leg_pelvic_roll"] = np.clip(-sway, 0, None)
-    # Ankle roll compensates in opposite direction
-    result["right_leg_ankle_roll"] = -np.clip(sway, 0, None) * 0.6
-    result["left_leg_ankle_roll"] = -np.clip(-sway, 0, None) * 0.6
+    # Both legs tilt together — pelvis moves as a unit instead of one leg at a
+    # time.  This keeps the support polygon centred under the CoM so the XY
+    # anchor in simulate.py does not have to fight lateral foot drift.
+    result["right_leg_pelvic_roll"] = sway
+    result["left_leg_pelvic_roll"] = sway
+    # Ankle roll compensates both feet simultaneously
+    result["right_leg_ankle_roll"] = sway * 0.6
+    result["left_leg_ankle_roll"] = sway * 0.6
     # Waist counter-rotates against hips for upper body expression
     result["waist_yaw"] = -measure_wave * 1.2 - phrase_env * 0.6
 
