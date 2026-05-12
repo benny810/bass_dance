@@ -130,7 +130,7 @@ def generate_trajectory(
     primitives = {
         "bounce": generate_bounce(sample_times, features, depth=0.20 * scale),
         "sway": generate_sway(sample_times, features, amplitude=0.12 * scale),
-        "step": generate_step(sample_times, features, step_depth=0.18 * scale),
+        # "step": generate_step(sample_times, features, step_depth=0.18 * scale),
         "squat": generate_squat(sample_times, features, squat_depth=0.40 * scale),
     }
 

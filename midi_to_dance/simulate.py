@@ -456,21 +456,29 @@ def main():
 
                 mujoco.mj_kinematics(model, data)
 
-                # -- 3. ZMP / CoM balance: pitch & roll of the floating base --
+                # -- 3. ZMP / CoM balance: pitch only of the floating base --
+                # Roll is intentionally NOT adjusted here — rotating the base
+                # around X would slide the feet laterally.  Lateral balance is
+                # handled by ankle-roll compensation in the sway primitive.
                 com = _compute_robot_com(model, data)
                 support_center = _compute_support_center(
                     data, left_ankle_id, right_ankle_id,
                 )
-                com_error = support_center - com[:2]  # desired - actual
+                com_error_x = support_center[0] - com[0]  # desired - actual
 
-                if abs(com_error[0]) < 0.003 and abs(com_error[1]) < 0.003:
+                if abs(com_error_x) < 0.003:
                     break
 
                 com_height = max(com[2] - FLOOR_Z, 0.1)
                 gain = 0.35
-                delta_pitch = np.clip(com_error[0] / com_height * gain, -0.06, 0.06)
-                delta_roll = np.clip(-com_error[1] / com_height * gain, -0.06, 0.06)
-                _apply_base_rotation(data.qpos, delta_pitch, delta_roll)
+                delta_pitch = np.clip(com_error_x / com_height * gain, -0.06, 0.06)
+                _apply_base_rotation(data.qpos, delta_pitch, 0.0)
+
+            # -- 4. XY anchor: cancel any foot drift so feet stay planted --
+            mujoco.mj_kinematics(model, data)
+            sc = _compute_support_center(data, left_ankle_id, right_ankle_id)
+            data.qpos[0] -= sc[0]
+            data.qpos[1] -= sc[1]
 
             # Save balanced pose back to the sequence
             qpos_sequence[frame] = data.qpos.copy()
@@ -531,7 +539,7 @@ def main():
         BALANCE_KP = 1.2
         BALANCE_KD = 0.08
         BALANCE_COM_H = 0.85
-        prev_com_error = np.zeros(2)
+        prev_com_error_x = 0.0
 
     sim_start_time = time.time()
     if audio_proc is None:
@@ -556,28 +564,24 @@ def main():
                     for csv_name, aid in ctrl_map.items():
                         data.ctrl[aid] = joint_data[csv_name][frame]
 
-                    # ZMP / CoM balance feedback on pelvic pitch & roll
+                    # ZMP / CoM balance feedback on pelvic pitch (forward/back only).
+                    # Roll is omitted to avoid lateral foot sliding.
                     support_center = _compute_support_center(
                         data, left_ankle_id_bal, right_ankle_id_bal,
                     )
                     com = _compute_robot_com(model, data)
-                    com_error = support_center - com[:2]
-                    d_error = (com_error - prev_com_error) / max(dt_traj, 1e-6)
+                    com_error_x = support_center[0] - com[0]
+                    d_error_x = (com_error_x - prev_com_error_x) / max(dt_traj, 1e-6)
 
-                    pitch_adj = (com_error[0] / BALANCE_COM_H * BALANCE_KP
-                                 + d_error[0] * BALANCE_KD)
-                    roll_adj = (-com_error[1] / BALANCE_COM_H * BALANCE_KP
-                                - d_error[1] * BALANCE_KD)
+                    pitch_adj = (com_error_x / BALANCE_COM_H * BALANCE_KP
+                                 + d_error_x * BALANCE_KD)
 
                     for side in ["left", "right"]:
                         csv_pp = f"{side}_leg_pelvic_pitch"
                         if csv_pp in ctrl_map:
                             data.ctrl[ctrl_map[csv_pp]] += pitch_adj
-                        csv_pr = f"{side}_leg_pelvic_roll"
-                        if csv_pr in ctrl_map:
-                            data.ctrl[ctrl_map[csv_pr]] += roll_adj
 
-                    prev_com_error = com_error.copy()
+                    prev_com_error_x = com_error_x
 
                     # Step physics
                     for _ in range(n_substeps):
