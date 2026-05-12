@@ -17,6 +17,63 @@ import mujoco
 import mujoco.viewer
 
 
+# ---------------------------------------------------------------------------
+# Quaternion math helpers
+# ---------------------------------------------------------------------------
+
+def _quat_multiply(q1, q2):
+    """Multiply two quaternions (w, x, y, z)."""
+    w1, x1, y1, z1 = q1
+    w2, x2, y2, z2 = q2
+    return np.array([
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+    ])
+
+
+def _apply_base_rotation(qpos, delta_pitch, delta_roll):
+    """Apply pitch (Y-axis) and roll (X-axis) rotation to the base_link
+    quaternion stored at qpos[3:7] (w,x,y,z)."""
+    cp = np.cos(delta_pitch / 2.0)
+    sp = np.sin(delta_pitch / 2.0)
+    q_pitch = np.array([cp, 0.0, sp, 0.0])
+
+    cr = np.cos(delta_roll / 2.0)
+    sr = np.sin(delta_roll / 2.0)
+    q_roll = np.array([cr, sr, 0.0, 0.0])
+
+    q_delta = _quat_multiply(q_pitch, q_roll)
+    q_current = qpos[3:7].copy()
+    q_new = _quat_multiply(q_delta, q_current)
+    q_new /= np.linalg.norm(q_new)
+    qpos[3:7] = q_new
+
+
+# ---------------------------------------------------------------------------
+# ZMP / CoM balance helpers
+# ---------------------------------------------------------------------------
+
+def _compute_robot_com(model, data):
+    """CoM of the robot subtree (base_link and descendants) in world frame.
+
+    Uses MuJoCo subtree_com which is computed during mj_kinematics / mj_forward.
+    """
+    base_link_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "base_link")
+    if base_link_id >= 0:
+        return data.subtree_com[base_link_id].copy()
+    return data.subtree_com[0].copy()
+
+
+def _compute_support_center(data, left_ankle_id, right_ankle_id):
+    """Support-polygon centre: midpoint of the two ankle-link world positions
+    projected to the ground plane."""
+    left = data.xpos[left_ankle_id][:2]
+    right = data.xpos[right_ankle_id][:2]
+    return (left + right) / 2.0
+
+
 def load_trajectory(csv_path: str, fps: float = 50.0):
     """Load CSV trajectory into (timestamps, joint_data dict, joint_names).
 
@@ -366,47 +423,57 @@ def main():
                     f.read(2)  # attribute
             foot_verts[side] = np.unique(np.array(verts, dtype=np.float32), axis=0)
 
-        print(f"  Computing foot-ground constraints "
+        print(f"  Computing foot-ground constraints + ZMP balance "
               f"(left: {len(foot_verts['left'])} verts, right: {len(foot_verts['right'])} verts)...")
 
         for frame in range(n_frames):
             data.qpos[:] = qpos_sequence[frame]
-            mujoco.mj_kinematics(model, data)
 
-            # Flatten both feet: solve for ankle_pitch / ankle_roll so the
-            # ankle_roll_link body +Z axis points straight up (world [0,0,1]).
-            # The foot mesh in body frame has sole at z=-0.0648, top at z=+0.0125,
-            # so +Z points from ankle center upward through the foot.
-            # Kinematic chain: R_world = R_knee * R_y(pitch) * R_x(roll)
-            # Closed form: pitch = atan2(z_k[0], z_k[2]), roll = asin(-z_k[1])
-            # where z_k is row 3 of the knee_pitch_link body xmat.
-            for side in ["left", "right"]:
-                z_k = data.xmat[ankle_pitch_parent[side]][6:9]
-                new_roll = np.arcsin(np.clip(-z_k[1], -1.0, 1.0))
-                new_pitch = np.arctan2(z_k[0], z_k[2])
+            # Iterative IK: foot-flattening, Z-contact, and CoM balance
+            for _iter in range(20):
+                mujoco.mj_kinematics(model, data)
 
-                # Clamp to joint limits
-                new_pitch = np.clip(new_pitch, *ankle_pitch_range[side])
-                new_roll = np.clip(new_roll, *ankle_roll_range[side])
+                # -- 1. Foot flattening: ankle pitch/roll so foot +Z points up --
+                for side in ["left", "right"]:
+                    z_k = data.xmat[ankle_pitch_parent[side]][6:9]
+                    new_roll = np.arcsin(np.clip(-z_k[1], -1.0, 1.0))
+                    new_pitch = np.arctan2(z_k[0], z_k[2])
+                    new_pitch = np.clip(new_pitch, *ankle_pitch_range[side])
+                    new_roll = np.clip(new_roll, *ankle_roll_range[side])
+                    data.qpos[ankle_pitch_qpos[side]] = new_pitch
+                    data.qpos[ankle_roll_qpos[side]] = new_roll
 
-                data.qpos[ankle_pitch_qpos[side]] = new_pitch
-                data.qpos[ankle_roll_qpos[side]] = new_roll
-                qpos_sequence[frame, ankle_pitch_qpos[side]] = new_pitch
-                qpos_sequence[frame, ankle_roll_qpos[side]] = new_roll
+                mujoco.mj_kinematics(model, data)
 
-            # Re-run kinematics with flattened feet
-            mujoco.mj_kinematics(model, data)
+                # -- 2. Foot-ground contact: base Z so lowest foot vertex touches floor --
+                foot_min_z = float("inf")
+                for side, body_id in [("left", left_ankle_id), ("right", right_ankle_id)]:
+                    xpos = data.xpos[body_id]
+                    z_row = data.xmat[body_id][6:9]
+                    world_z = xpos[2] + foot_verts[side] @ z_row
+                    foot_min_z = min(foot_min_z, world_z.min())
+                data.qpos[2] += FLOOR_Z - float(foot_min_z)
 
-            # Transform foot mesh vertices to world frame, find lowest z
-            foot_min_z = float("inf")
-            for side, body_id in [("left", left_ankle_id), ("right", right_ankle_id)]:
-                xpos = data.xpos[body_id]
-                z_row = data.xmat[body_id][6:9]
-                world_z = xpos[2] + foot_verts[side] @ z_row
-                foot_min_z = min(foot_min_z, world_z.min())
+                mujoco.mj_kinematics(model, data)
 
-            dz = FLOOR_Z - float(foot_min_z)
-            qpos_sequence[frame, 2] += dz
+                # -- 3. ZMP / CoM balance: pitch & roll of the floating base --
+                com = _compute_robot_com(model, data)
+                support_center = _compute_support_center(
+                    data, left_ankle_id, right_ankle_id,
+                )
+                com_error = support_center - com[:2]  # desired - actual
+
+                if abs(com_error[0]) < 0.003 and abs(com_error[1]) < 0.003:
+                    break
+
+                com_height = max(com[2] - FLOOR_Z, 0.1)
+                gain = 0.35
+                delta_pitch = np.clip(com_error[0] / com_height * gain, -0.06, 0.06)
+                delta_roll = np.clip(-com_error[1] / com_height * gain, -0.06, 0.06)
+                _apply_base_rotation(data.qpos, delta_pitch, delta_roll)
+
+            # Save balanced pose back to the sequence
+            qpos_sequence[frame] = data.qpos.copy()
 
     # Audio playback via aplay/paplay
     audio_proc = None
@@ -456,6 +523,16 @@ def main():
         n_substeps = max(1, round(dt_traj / model.opt.timestep))
         print(f"  Physics: {n_substeps} substeps/frame (timestep={model.opt.timestep:.4f}s)")
 
+        # ZMP balance controller state
+        left_ankle_id_bal = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY,
+                                               "left_leg_ankle_roll_link")
+        right_ankle_id_bal = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY,
+                                                "right_leg_ankle_roll_link")
+        BALANCE_KP = 1.2
+        BALANCE_KD = 0.08
+        BALANCE_COM_H = 0.85
+        prev_com_error = np.zeros(2)
+
     sim_start_time = time.time()
     if audio_proc is None:
         print("  (no audio)")
@@ -478,6 +555,30 @@ def main():
                     # Set position targets for all controlled joints
                     for csv_name, aid in ctrl_map.items():
                         data.ctrl[aid] = joint_data[csv_name][frame]
+
+                    # ZMP / CoM balance feedback on pelvic pitch & roll
+                    support_center = _compute_support_center(
+                        data, left_ankle_id_bal, right_ankle_id_bal,
+                    )
+                    com = _compute_robot_com(model, data)
+                    com_error = support_center - com[:2]
+                    d_error = (com_error - prev_com_error) / max(dt_traj, 1e-6)
+
+                    pitch_adj = (com_error[0] / BALANCE_COM_H * BALANCE_KP
+                                 + d_error[0] * BALANCE_KD)
+                    roll_adj = (-com_error[1] / BALANCE_COM_H * BALANCE_KP
+                                - d_error[1] * BALANCE_KD)
+
+                    for side in ["left", "right"]:
+                        csv_pp = f"{side}_leg_pelvic_pitch"
+                        if csv_pp in ctrl_map:
+                            data.ctrl[ctrl_map[csv_pp]] += pitch_adj
+                        csv_pr = f"{side}_leg_pelvic_roll"
+                        if csv_pr in ctrl_map:
+                            data.ctrl[ctrl_map[csv_pr]] += roll_adj
+
+                    prev_com_error = com_error.copy()
+
                     # Step physics
                     for _ in range(n_substeps):
                         mujoco.mj_step(model, data)

@@ -80,13 +80,14 @@ JOINT_LIMITS = {
 # Neutral stance added to all trajectories before motion primitives.
 # Knee bend gives a natural "ready" posture; hip abduction widens the stance.
 NEUTRAL_STANCE = {
-    "left_leg_pelvic_pitch": 0.12,    # slight forward lean (knee bend compensation)
+    # Pelvic pitch set to 0 — torso lean is handled by ZMP/CoM balance in simulation
+    "left_leg_pelvic_pitch": 0.0,
     "left_leg_pelvic_roll": 0.20,     # left leg abduct (wider stance)
     "left_leg_pelvic_yaw": 0.0,
     "left_leg_knee_pitch": 0.35,      # baseline knee bend
     "left_leg_ankle_pitch": 0.0,
     "left_leg_ankle_roll": -0.12,     # evert to keep foot flat on wider stance
-    "right_leg_pelvic_pitch": 0.12,   # slight forward lean
+    "right_leg_pelvic_pitch": 0.0,
     "right_leg_pelvic_roll": -0.20,   # right leg abduct (wider stance)
     "right_leg_pelvic_yaw": 0.0,
     "right_leg_knee_pitch": 0.35,     # baseline knee bend
