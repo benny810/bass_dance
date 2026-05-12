@@ -175,32 +175,54 @@ def synthesize_midi_audio(midi_path: str, sample_rate: int = 44100, speed: float
         t = np.arange(n_samples) / sample_rate
         dur = t_end - t_start
 
-        # ADSR envelope
-        attack = min(0.02, dur * 0.1)
-        decay = min(0.05, dur * 0.2)
-        release = min(0.08, dur * 0.3)
-        sustain_level = 0.6
+        # ---- Plucked-string envelope ----
+        # Fast attack (~3ms), then exponential decay.  Higher notes decay
+        # faster (shorter / higher-tension strings lose energy quicker).
+        attack_time = 0.003
+        base_decay = 0.7 + 2.0 * (freq / 100.0)
 
         env = np.ones(n_samples)
-        i_attack = int(attack * sample_rate)
-        i_decay = int((attack + decay) * sample_rate)
-        i_release_start = max(0, n_samples - int(release * sample_rate))
-
+        i_attack = min(int(attack_time * sample_rate), n_samples)
         if i_attack > 0:
             env[:i_attack] = np.linspace(0, 1, i_attack)
-        if i_decay > i_attack:
-            env[i_attack:i_decay] = np.linspace(1, sustain_level, i_decay - i_attack)
-        env[i_decay:i_release_start] = sustain_level
-        if i_release_start < n_samples:
-            env[i_release_start:] = np.linspace(sustain_level, 0, n_samples - i_release_start)
+        decay_t = np.maximum(t - attack_time, 0)
+        env = env * np.exp(-base_decay * decay_t)
+        env = np.maximum(env, 0.03)
 
-        # Bass-like tone: fundamental + 3 harmonics
-        wave = (0.7 * np.sin(2 * np.pi * freq * t) +
-                0.2 * np.sin(2 * np.pi * freq * 2 * t) +
-                0.07 * np.sin(2 * np.pi * freq * 3 * t) +
-                0.03 * np.sin(2 * np.pi * freq * 4 * t))
+        # ---- Harmonic synthesis with per-harmonic decay ----
+        # Plucked strings: fundamental is loudest & decays slowest; each
+        # higher partial decays progressively faster.
+        harmonics = [
+            (1.0,  1.0),     # fundamental
+            (0.48, 1.8),     # 2nd
+            (0.28, 3.0),     # 3rd
+            (0.14, 5.0),     # 4th
+            (0.07, 8.0),     # 5th
+            (0.035, 12.0),   # 6th
+            (0.018, 17.0),   # 7th
+            (0.008, 23.0),   # 8th
+        ]
 
-        audio[i_start:i_end] += wave * env * vel * 0.8
+        wave = np.zeros(n_samples, dtype=np.float64)
+        for h, (amp, hdecay_extra) in enumerate(harmonics):
+            h_freq = freq * (h + 1)
+            h_env = env * np.exp(-base_decay * (hdecay_extra - 1.0) * decay_t)
+            h_env = np.maximum(h_env, 0.001)
+            wave += amp * np.sin(2 * np.pi * h_freq * t) * h_env
+
+        # ---- Pluck transient (pick/finger noise) ----
+        pluck_len = min(int(0.012 * sample_rate), n_samples)
+        if pluck_len > 0:
+            rng = np.random.RandomState(i_start + int(freq * 1000))
+            pluck_noise = rng.randn(pluck_len) * 0.22
+            pluck_t = np.arange(pluck_len) / sample_rate
+            pluck_env = np.exp(-pluck_t / 0.004)
+            wave[:pluck_len] += pluck_noise * pluck_env
+
+        # ---- Soft saturation (tube/DI warmth) ----
+        wave = np.tanh(wave * 1.3) / 1.3
+
+        audio[i_start:i_end] += (wave * vel * 0.7).astype(np.float32)
 
     # Normalize
     peak = np.abs(audio).max()
@@ -234,6 +256,8 @@ def main():
                         help="Frames per second for CSV without timestamp column (default: 50)")
     parser.add_argument("--dynamics", action="store_true",
                         help="Run physics dynamics simulation (default: kinematic)")
+    parser.add_argument("--save-audio", type=str, default=None, metavar="PATH",
+                        help="Save synthesized audio WAV to PATH and exit")
     args = parser.parse_args()
 
     # Load trajectory
@@ -256,7 +280,20 @@ def main():
         audio, sample_rate, audio_duration = synthesize_midi_audio(
             args.midi_file, speed=args.slow
         )
-        print(f"  {audio_duration:.1f}s audio, {sample_rate} Hz")
+        peak = np.abs(audio).max()
+        rms = np.sqrt(np.mean(audio ** 2))
+        print(f"  {audio_duration:.1f}s audio, {sample_rate} Hz, peak={peak:.3f}, RMS={rms:.4f}")
+        if args.save_audio:
+            import wave as _wave_save
+            audio_int16 = (audio * 32767).astype(np.int16)
+            with _wave_save.open(args.save_audio, "w") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(sample_rate)
+                wf.writeframes(audio_int16.tobytes())
+            print(f"  Audio saved to: {args.save_audio}")
+            print("  Test playback:  paplay " + args.save_audio)
+            return
     elif args.midi_file is None:
         print("No MIDI file provided, running without audio (-h for help)")
 
@@ -527,6 +564,7 @@ def main():
             wf.setsampwidth(2)
             wf.setframerate(sample_rate)
             wf.writeframes(audio_int16.tobytes())
+        print(f"  WAV written: {wav_path} ({len(audio_int16)} samples)")
 
         # Find available player
         import shutil
@@ -537,14 +575,23 @@ def main():
                 break
 
         if player:
-            print(f"  Starting audio: {player}")
+            print(f"  Starting audio: {player} {wav_path}")
             audio_proc = subprocess.Popen(
                 [player, wav_path],
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
             )
-            # Give the audio player time to open the device and start buffering
-            time.sleep(0.3)
+            time.sleep(0.5)
+            poll = audio_proc.poll()
+            if poll is not None:
+                print(f"  WARNING: audio player exited early with code {poll}")
+                print(f"  The player command was: {player} {wav_path}")
+                print(f"  Try running it manually to see error details.")
+            else:
+                print(f"  Audio player running (pid={audio_proc.pid})")
+        else:
+            print("  WARNING: no audio player found (tried paplay, aplay, ffplay)")
+            print(f"  WAV file at: {wav_path}")
+            print(f"  Install with: sudo apt install pulseaudio-utils")
 
     # MuJoCo viewer
     mode_label = "dynamics" if args.dynamics else "kinematic"
