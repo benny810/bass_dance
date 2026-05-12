@@ -102,10 +102,13 @@ def load_trajectory(csv_path: str, fps: float = 50.0):
     return timestamps, joint_data, joint_names
 
 
-def synthesize_midi_audio(midi_path: str, sample_rate: int = 44100):
+def synthesize_midi_audio(midi_path: str, sample_rate: int = 44100, speed: float = 1.0):
     """Synthesize audio from MIDI file using additive synthesis.
 
-    Returns (audio_samples, sample_rate).
+    When speed < 1.0, the audio is time-stretched so a normal-speed player
+    stays in sync with a slowed-down simulation.
+
+    Returns (audio_samples, sample_rate, total_duration).
     audio_samples is a 1D float32 numpy array in [-1, 1].
     """
     import mido
@@ -204,6 +207,15 @@ def synthesize_midi_audio(midi_path: str, sample_rate: int = 44100):
     if peak > 0:
         audio /= peak * 1.1
 
+    # Time-stretch for slow-motion playback
+    if speed != 1.0:
+        old_len = len(audio)
+        new_len = int(old_len / speed)
+        old_t = np.arange(old_len)
+        new_t = np.linspace(0, old_len - 1, new_len)
+        audio = np.interp(new_t, old_t, audio).astype(np.float32)
+        total_duration /= speed
+
     return audio.astype(np.float32), sample_rate, total_duration
 
 
@@ -212,7 +224,8 @@ def main():
         description="MuJoCo simulation of robot dance with synced MIDI audio"
     )
     parser.add_argument("csv_file", type=str, help="CSV trajectory file")
-    parser.add_argument("midi_file", type=str, help="MIDI file for audio")
+    parser.add_argument("midi_file", type=str, nargs="?", default=None,
+                        help="MIDI file for audio (optional)")
     parser.add_argument("--slow", type=float, default=1.0,
                         help="Playback speed factor (default: 1.0)")
     parser.add_argument("--no-audio", action="store_true",
@@ -238,10 +251,14 @@ def main():
     # Synthesize audio
     audio = None
     sample_rate = 44100
-    if not args.no_audio:
+    if not args.no_audio and args.midi_file is not None:
         print(f"Synthesizing audio from: {args.midi_file}")
-        audio, sample_rate, audio_duration = synthesize_midi_audio(args.midi_file)
+        audio, sample_rate, audio_duration = synthesize_midi_audio(
+            args.midi_file, speed=args.slow
+        )
         print(f"  {audio_duration:.1f}s audio, {sample_rate} Hz")
+    elif args.midi_file is None:
+        print("No MIDI file provided, running without audio (-h for help)")
 
     # Build scene XML with floating base_link, checkerboard floor, and position actuators.
     # The robot XML is embedded inline so we can wrap its bodies in a free-floating base_link.
@@ -385,7 +402,7 @@ def main():
         # Ankle pitch/roll joint qpos indices and parent body IDs for foot flattening
         ankle_pitch_qpos = {}
         ankle_roll_qpos = {}
-        ankle_pitch_parent = {}  # parent body of ankle_pitch_link
+        ankle_pitch_parent = {}
         ankle_pitch_range = {}
         ankle_roll_range = {}
 
@@ -483,6 +500,12 @@ def main():
             # Save balanced pose back to the sequence
             qpos_sequence[frame] = data.qpos.copy()
 
+            # Progress indicator
+            if (frame + 1) % 1000 == 0 or frame == n_frames - 1:
+                pct = (frame + 1) / n_frames * 100
+                print(f"\r  ... {pct:.0f}% ({frame + 1}/{n_frames} frames)", end="", flush=True)
+        print()  # newline after progress
+
     # Audio playback via aplay/paplay
     audio_proc = None
     temp_wav = None
@@ -520,7 +543,8 @@ def main():
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            time.sleep(0.1)  # Let audio player buffer
+            # Give the audio player time to open the device and start buffering
+            time.sleep(0.3)
 
     # MuJoCo viewer
     mode_label = "dynamics" if args.dynamics else "kinematic"
@@ -542,11 +566,10 @@ def main():
         prev_com_error_x = 0.0
 
     sim_start_time = time.time()
-    if audio_proc is None:
-        print("  (no audio)")
-    else:
+    if audio_proc is not None:
         print("  Audio + motion synced")
-        sim_start_time = time.time()  # reset after audio started
+    else:
+        print("  (no audio)")
 
     with mujoco.viewer.launch_passive(model, data) as viewer:
         viewer.cam.distance = 3.0
@@ -596,11 +619,18 @@ def main():
 
     # Cleanup
     if audio_proc is not None:
-        audio_proc.terminate()
-        audio_proc.wait()
+        try:
+            audio_proc.terminate()
+            audio_proc.wait(timeout=2)
+        except Exception:
+            try:
+                audio_proc.kill()
+                audio_proc.wait(timeout=1)
+            except Exception:
+                pass
     if temp_wav is not None:
-        import os
-        os.unlink(temp_wav.name)
+        import os as _os4
+        _os4.unlink(temp_wav.name)
 
 
 if __name__ == "__main__":

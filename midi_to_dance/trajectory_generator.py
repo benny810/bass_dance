@@ -4,12 +4,7 @@ from typing import Dict, List, Tuple, Optional
 import numpy as np
 from .midi_parser import parse_midi, MidiData
 from .feature_extractor import extract_features, MusicalFeatures
-from .motion_primitives import (
-    generate_bounce,
-    generate_sway,
-    generate_step,
-    generate_squat,
-)
+from .pca_motion import generate_pca_motion, LOWER_BODY_JOINTS
 
 
 JOINT_NAMES = [
@@ -120,35 +115,35 @@ def generate_trajectory(
 ) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
     """Generate full joint trajectories from a MIDI file.
 
+    Lower-body joints (legs + waist) are generated from PCA motion primitives
+    extracted from mocap data.  Arm joints stay at their NEUTRAL_STANCE values.
+
     Returns (sample_times, dict of joint_name -> angle_array).
     """
     midi_data = parse_midi(midi_path)
     features = extract_features(midi_data, dt=dt)
     sample_times = features.sample_times
 
-    # Generate primitive contributions
-    primitives = {
-        "bounce": generate_bounce(sample_times, features, depth=0.20 * scale),
-        "sway": generate_sway(sample_times, features, amplitude=0.12 * scale),
-        # "step": generate_step(sample_times, features, step_depth=0.18 * scale),
-        "squat": generate_squat(sample_times, features, squat_depth=0.40 * scale),
-    }
+    # PCA-based lower-body motion (absolute joint angles, not offsets)
+    pca_output = generate_pca_motion(sample_times, features, scale=scale)
 
-    # Superpose contributions + neutral stance into each joint
+    lower_set = set(LOWER_BODY_JOINTS)
     trajectories: Dict[str, np.ndarray] = {}
     for joint_name in JOINT_NAMES:
-        traj = np.full(len(sample_times), NEUTRAL_STANCE.get(joint_name, 0.0))
-        for prim_name, prim_output in primitives.items():
-            if joint_name in prim_output:
-                traj += prim_output[joint_name]
-        trajectories[joint_name] = traj
+        if joint_name in lower_set:
+            trajectories[joint_name] = pca_output[joint_name]
+        else:
+            # Arm joints stay at constant NEUTRAL_STANCE pose
+            trajectories[joint_name] = np.full(
+                len(sample_times), NEUTRAL_STANCE.get(joint_name, 0.0)
+            )
 
     # Clamp to joint limits
     for joint_name in JOINT_NAMES:
         low, high = JOINT_LIMITS[joint_name]
         trajectories[joint_name] = np.clip(trajectories[joint_name], low, high)
 
-    # Light smoothing to remove artifacts
+    # Light smoothing
     from scipy.ndimage import gaussian_filter1d
     sigma = 2  # ~40ms at 50Hz
     for joint_name in JOINT_NAMES:
