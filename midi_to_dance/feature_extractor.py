@@ -19,6 +19,7 @@ class MusicalFeatures:
     is_downbeat: np.ndarray       # 1.0 at measure downbeats, 0.0 elsewhere
     is_beat: np.ndarray           # 1.0 at any beat boundary
     pitch_contour: np.ndarray     # smoothed pitch change trend (-1 to 1)
+    pitch_level: np.ndarray       # smoothed absolute pitch level (0 to 1)
     accent: np.ndarray            # accent strength (0 to 1)
     is_low_note: np.ndarray       # 1.0 when low notes (F2/A2) are sounding
 
@@ -80,14 +81,14 @@ def extract_features(midi_data: MidiData, dt: float = 0.02) -> MusicalFeatures:
         sigma = int(seconds_per_beat * 2 / dt)  # smooth over ~2 beats
         sigma = max(sigma, 3)
         from scipy.ndimage import gaussian_filter1d
-        pitch_contour_raw = gaussian_filter1d(pitch_values, sigma=sigma)
-        # Normalize and compute differences for contour direction
-        pitch_contour_raw = np.clip(pitch_contour_raw, 0, 1)
-        pitch_contour = np.gradient(pitch_contour_raw)
+        pitch_level = gaussian_filter1d(pitch_values, sigma=sigma)
+        pitch_level = np.clip(pitch_level, 0, 1)
+        pitch_contour = np.gradient(pitch_level)
         pitch_contour = np.clip(pitch_contour * 10, -1, 1)  # amplify small changes
         # Also smooth the contour itself
         pitch_contour = gaussian_filter1d(pitch_contour, sigma=sigma)
     else:
+        pitch_level = np.zeros(n_samples)
         pitch_contour = np.zeros(n_samples)
 
     # Beat phase (where we are within each beat, 0.0 to 1.0)
@@ -124,6 +125,7 @@ def extract_features(midi_data: MidiData, dt: float = 0.02) -> MusicalFeatures:
         is_downbeat=is_downbeat,
         is_beat=is_beat,
         pitch_contour=pitch_contour,
+        pitch_level=pitch_level,
         accent=accent,
         is_low_note=is_low_note,
         onset_indices=np.array(sorted(set(onset_events))),

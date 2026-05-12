@@ -64,11 +64,20 @@ def generate_bounce(
     # Clamp to reasonable range
     bounce_env = np.clip(bounce_env, 0, depth * 1.5)
 
+    # Deviation from track's own mean pitch drives torso lean direction.
+    # Above-average notes → forward lean (俯身), below-average → backward (后仰).
+    # Using relative pitch guarantees both directions appear regardless of the
+    # absolute note range (e.g. bass tracks that are naturally low).
+    pitch_dev = features.pitch_level - np.mean(features.pitch_level)
+    pitch_lean = -np.clip(pitch_dev * 5.0, -1.0, 1.0)
+
     return {
         "left_leg_knee_pitch": bounce_env.copy(),
         "right_leg_knee_pitch": bounce_env.copy(),
-        "left_leg_pelvic_pitch": bounce_env * 0.3,
-        "right_leg_pelvic_pitch": bounce_env * 0.3,
+        # Pelvic pitch modulated by pitch contour: high notes → hips forward,
+        # low notes → hips back, creating musical torso expression.
+        "left_leg_pelvic_pitch": bounce_env * 0.25 * pitch_lean,
+        "right_leg_pelvic_pitch": bounce_env * 0.25 * pitch_lean,
         "waist_yaw": waist_env,
     }
 
@@ -244,6 +253,8 @@ def generate_squat(
     return {
         "left_leg_knee_pitch": squat_env.copy(),
         "right_leg_knee_pitch": squat_env.copy(),
-        "left_leg_pelvic_pitch": squat_env * 0.25,
-        "right_leg_pelvic_pitch": squat_env * 0.25,
+        # Negative pelvic_pitch: hips pitch forward during deep squat to keep
+        # the torso upright instead of leaning backward.
+        "left_leg_pelvic_pitch": -squat_env * 0.7,
+        "right_leg_pelvic_pitch": -squat_env * 0.7,
     }
