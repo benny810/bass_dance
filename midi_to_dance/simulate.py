@@ -498,21 +498,48 @@ def main():
         print(f"  Computing foot-ground constraints + hip foot-lock "
               f"(left: {len(foot_verts['left'])} verts, right: {len(foot_verts['right'])} verts)...")
 
-        # Pre-resolve hip joint qpos indices for both feet
+        # Pre-resolve hip joint qpos indices for both feet.
+        # We only use pelvic_pitch + pelvic_roll in the foot-lock IK;
+        # pelvic_yaw is left free so natural hip-twist motion comes through.
         left_hip_qidxs = []
         right_hip_qidxs = []
         for side, store in [("left", left_hip_qidxs), ("right", right_hip_qidxs)]:
-            for jn in ["pelvic_pitch", "pelvic_roll", "pelvic_yaw"]:
+            for jn in ["pelvic_pitch", "pelvic_roll"]:
                 jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT,
                                         f"{side}_leg_{jn}_joint")
                 store.append(model.jnt_qposadr[jid])
+
+        # Knee qpos indices for step-aware de-rhythmisation
+        knee_qpos = {}
+        for side in ["left", "right"]:
+            jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT,
+                                    f"{side}_leg_knee_pitch_joint")
+            knee_qpos[side] = model.jnt_qposadr[jid]
+
+        # Low-pass-filtered knee trajectories: sigma = 0.15 s removes
+        # beat-frequency content (~430 ms at 86 BPM) while preserving
+        # slower step-scale motion.
+        from scipy.ndimage import gaussian_filter1d
+        knee_smooth_sigma = max(int(0.15 / dt_traj), 2)
+        knee_smooth = {}
+        for side in ["left", "right"]:
+            key = f"{side}_leg_knee_pitch"
+            if key in joint_data:
+                knee_smooth[side] = gaussian_filter1d(joint_data[key], sigma=knee_smooth_sigma)
 
         # Carry over base pose from the previous frame so the IK doesn't
         # have to fight a qpos0 reset every frame.
         prev_qpos_base = model.qpos0.copy()  # [x, y, z, qw, qx, qy, qz, ...]
 
-        prev_left_xy = None
-        prev_right_xy = None
+        # Foot anchors track the "natural" foot position via a very slow EMA.
+        # Fast micro-movements (beat-triggered knee flex) are filtered out;
+        # only sustained stepping motions move the anchors.  alpha was chosen
+        # so the time constant is ~2.5 s — much longer than a single beat.
+        anchor_alpha = 0.005   # time constant ~4 s at 50 Hz
+        anchor_left_xy = None
+        anchor_right_xy = None
+        stepping_left = False
+        stepping_right = False
 
         for frame in range(n_frames):
             data.qpos[:] = qpos_sequence[frame]
@@ -520,10 +547,38 @@ def main():
             # with the previous frame's converged base pose.
             data.qpos[:7] = prev_qpos_base[:7]
 
-            if prev_left_xy is None:
+            if anchor_left_xy is None:
                 mujoco.mj_kinematics(model, data)
-                prev_left_xy = data.xpos[left_ankle_id][:2].copy()
-                prev_right_xy = data.xpos[right_ankle_id][:2].copy()
+                anchor_left_xy = data.xpos[left_ankle_id][:2].copy()
+                anchor_right_xy = data.xpos[right_ankle_id][:2].copy()
+
+            # Sample intended foot positions BEFORE Phase 1 IK.
+            # These reflect the raw trajectory intent and give a clean
+            # step-detection signal, free of IK-induced distortions.
+            mujoco.mj_kinematics(model, data)
+            intended_l = data.xpos[left_ankle_id][:2].copy()
+            intended_r = data.xpos[right_ankle_id][:2].copy()
+
+            # Binary step detection with hysteresis.
+            # Once a foot moves far enough from its anchor it enters "step"
+            # mode and the knee is fully de-rhythmised.  It stays in step
+            # mode until the foot settles back near the anchor.
+            err_l = np.linalg.norm(intended_l - anchor_left_xy)
+            err_r = np.linalg.norm(intended_r - anchor_right_xy)
+            if stepping_left:
+                stepping_left = err_l > 0.002
+            else:
+                stepping_left = err_l > 0.005
+            if stepping_right:
+                stepping_right = err_r > 0.002
+            else:
+                stepping_right = err_r > 0.005
+
+            # Apply knee de-rhythmisation BEFORE Phase 1 so the flattened
+            # foot and Z-contact are computed with the step-aware knee.
+            for side, stepping in [("left", stepping_left), ("right", stepping_right)]:
+                if stepping:
+                    data.qpos[knee_qpos[side]] = knee_smooth[side][frame]
 
             # -- Phase 1: converge foot flattening + ground contact
             #    (no hip adjustment yet, so these two don't fight each other)
@@ -551,11 +606,14 @@ def main():
                     foot_min_z = min(foot_min_z, world_z.min())
                 data.qpos[2] += FLOOR_Z - float(foot_min_z)
 
+            # EMA-update foot anchors from natural (post-Phase-1) positions.
+            mujoco.mj_kinematics(model, data)
+            natural_l = data.xpos[left_ankle_id][:2].copy()
+            natural_r = data.xpos[right_ankle_id][:2].copy()
+            anchor_left_xy = anchor_alpha * natural_l + (1.0 - anchor_alpha) * anchor_left_xy
+            anchor_right_xy = anchor_alpha * natural_r + (1.0 - anchor_alpha) * anchor_right_xy
+
             # -- Phase 2: hip foot-lock (after feet are flat & on ground) --
-            #    One damped least-squares step per foot.  Kinematics are
-            #    refreshed after *every* qpos change to avoid stale Jacobian
-            #    entries and to capture left↔right cross-coupling through
-            #    the pelvis.
             eps_jac = 0.001   # finite-difference perturbation
             lam_ik = 0.005    # damping
             lr_ik = 0.4       # step size
@@ -564,9 +622,9 @@ def main():
                 # -- Left foot --
                 mujoco.mj_kinematics(model, data)
                 cur_l = data.xpos[left_ankle_id][:2].copy()
-                err_l = prev_left_xy - cur_l
+                err_l = anchor_left_xy - cur_l
                 if np.dot(err_l, err_l) >= 0.001 ** 2:
-                    Jl = np.zeros((2, 3))
+                    Jl = np.zeros((2, 2))
                     for j, qidx in enumerate(left_hip_qidxs):
                         orig = data.qpos[qidx]
                         data.qpos[qidx] = orig + eps_jac
@@ -582,9 +640,9 @@ def main():
                 # -- Right foot --
                 mujoco.mj_kinematics(model, data)
                 cur_r = data.xpos[right_ankle_id][:2].copy()
-                err_r = prev_right_xy - cur_r
+                err_r = anchor_right_xy - cur_r
                 if np.dot(err_r, err_r) >= 0.001 ** 2:
-                    Jr = np.zeros((2, 3))
+                    Jr = np.zeros((2, 2))
                     for j, qidx in enumerate(right_hip_qidxs):
                         orig = data.qpos[qidx]
                         data.qpos[qidx] = orig + eps_jac
@@ -599,15 +657,23 @@ def main():
 
                 # Check convergence
                 mujoco.mj_kinematics(model, data)
-                le = np.linalg.norm(prev_left_xy - data.xpos[left_ankle_id][:2])
-                re = np.linalg.norm(prev_right_xy - data.xpos[right_ankle_id][:2])
+                le = np.linalg.norm(anchor_left_xy - data.xpos[left_ankle_id][:2])
+                re = np.linalg.norm(anchor_right_xy - data.xpos[right_ankle_id][:2])
                 if le < 0.001 and re < 0.001:
                     break
 
-            # Update tracked positions for next frame
+            # -- Phase 3: Z-push to prevent foot-ground penetration --
+            # After all IK adjustments, some foot vertices may have dipped
+            # below the floor.  Push the base up just enough to clear them.
             mujoco.mj_kinematics(model, data)
-            prev_left_xy = data.xpos[left_ankle_id][:2].copy()
-            prev_right_xy = data.xpos[right_ankle_id][:2].copy()
+            foot_min_z = float("inf")
+            for side, body_id in [("left", left_ankle_id), ("right", right_ankle_id)]:
+                xpos = data.xpos[body_id]
+                z_row = data.xmat[body_id][6:9]
+                world_z = xpos[2] + foot_verts[side] @ z_row
+                foot_min_z = min(foot_min_z, world_z.min())
+            if foot_min_z < FLOOR_Z:
+                data.qpos[2] += FLOOR_Z - float(foot_min_z)
 
             qpos_sequence[frame] = data.qpos.copy()
             prev_qpos_base = data.qpos.copy()  # carry base + joints to next frame

@@ -242,7 +242,7 @@ def _pc3_beat_accent(
     amplitude: float,
 ) -> np.ndarray:
     """PC3 accent: beat-synced heel-toe rocking, modulated by onset envelope."""
-    activation = np.sin(2 * np.pi * beat_phase) * amplitude * 0.5
+    activation = np.sin(2 * np.pi * beat_phase) * amplitude * 0.25
 
     onset_env = np.zeros(n)
     for idx in onset_indices:
@@ -377,14 +377,14 @@ def generate_pca_motion(
 
     for i in range(n_comp):
         envelope = base_level + dynamic_range * (energy ** 1.5)
-        activations[:, i] = carriers[:, i] * envelope * amps[i] * 2.0
+        activations[:, i] = carriers[:, i] * envelope * amps[i] * 1.2
 
     # -- Event-driven accents (30% of energy) --
     if n_comp >= 1:
         activations[:, 0] += _pc1_onset_accent(
             n, dt, features.onset_indices, features.onset_strength,
             features.beat_phase, features.accent,
-            depth=amps[0] * 1.2,
+            depth=amps[0] * 0.35,
         )
 
     if n_comp >= 2:
@@ -398,7 +398,7 @@ def generate_pca_motion(
         activations[:, 2] += _pc3_beat_accent(
             n, dt, features.beat_phase, features.onset_indices,
             features.onset_strength,
-            amplitude=amps[2],
+            amplitude=amps[2] * 0.35,
         )
 
     if n_comp >= 4:
