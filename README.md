@@ -82,15 +82,17 @@ lower_trajs[t] = mean_pose + Σ_i activation_i[t] × component[i]
                                   │
                    ┌──────────────┴──────────────────────────┐
                    │          事件重音 (~30% 能量)             │
-                   │   PC1: 拍子屈膝脉冲 (指数衰减 τ=0.15s)     │
-                   │   PC2: 音高调制 + 小节波 + 乐句脉冲         │
-                   │   PC3: 节拍正弦 × 起始强度包络              │
-                   │   PC4: 重音低音 ADSR 跨步                  │
-                   │   PC5: 音符密度 × 慢速符号振荡              │
-                   │   PC6: 音高范围 → 重心偏移 (轨内归一化)     │
-                   │   PC7: 乐句级 cos 半周期呼吸弧线             │
+                   │   PC1 ← 节拍正弦 × 起始密度  (反对称负重摇摆)│
+                   │   PC2 ← 重音低音 ADSR + 符号交替 (反对称跨步)│
+                   │   PC3 ← onset 屈膝脉冲 (+正激活 = 屈膝)     │
+                   │   PC4 ← 音高调制 + 小节波 + 乐句脉冲 (yaw)  │
+                   │   PC5 ← 乐句级 cos 半周期呼吸弧 (前倾)      │
+                   │   PC6 ← 音符密度 × ~48 拍慢正弦 (侧倾)      │
+                   │   PC7 ← 音高 register tanh (微伸展)         │
                    └──────────────────────────────────────────┘
 ```
+
+> **事件 ↔ PC 映射逻辑：** 每个音乐驱动信号绑到与其动作类型匹配的 PC 槽——节拍正弦（自然左右交替）驱动反对称摇摆 PC1；onset 脉冲（一次性正激活）驱动对称下蹲 PC3；乐句弧（缓慢呼吸）驱动对称前倾 PC5……依此类推。这样 onset、节拍、音高、乐句各特征不会互相打架，而是各自激活最贴近其形态的协调模式。重写后关节范围比旧分发提升 5–25%（贡献相加而非抵消），同时保留双侧对称结构（hip_yaw L/R 相关 +0.89，knee +0.16 等）。
 
 **关键设计决策：**
 - **不可公度周期**：7×3=21 个不同周期，频比皆为无理数，整首乐曲内动作不重复
@@ -98,21 +100,40 @@ lower_trajs[t] = mean_pose + Σ_i activation_i[t] × component[i]
 - **音乐调制幅度而非触发事件**：音符密度决定动作有多大，而非触发是否动作
 - **事件重音叠加**：拍子屈膝、重音跨步等仍在连续运动之上叠加，保持音乐响应性
 
-### MIDI 特征提取
+### MIDI 解析 + 音乐特征提取
 
-从 MIDI 文件中提取以下音乐特征作为舞蹈动作的驱动信号：
+`midi_parser.py` 把 MIDI 解析成 `MidiData`，关键设计：
 
-| 特征 | 来源 | 用途 |
-|------|------|------|
-| **onset_strength** | velocity / 127 | PC1 屈膝幅度, PC3/PC5 调制 |
-| **beat_phase** | 拍内位置 (0=downbeat, 0.5=upbeat) | PC1 downbeat 深度区分, PC3 节拍正弦 |
-| **accent** | velocity > 均值+0.5σ | PC1/PC4 触发条件, 能量包络 |
-| **pitch_level** | 音高归一化 (0~1), 高斯平滑 | PC2/PC6 连续调制 (轨内中心化) |
-| **pitch_contour** | pitch_level 的梯度 | 音乐能量调制的辅助信号 |
-| **is_low_note** | 低音音符 (≤ 最低音+40%间距) | PC4 跨步触发条件之一 |
-| **is_downbeat** | 每小节第一拍 | PC4 跨步触发条件之一 |
-| **phrase_boundaries** | onset 间隔 ≥ 2 拍 | PC2 乐句脉冲, PC7 乐句呼吸弧线 |
-| **bpm / time_signature** | MIDI tempo 轨道 | 所有周期/节拍计算的基础 |
+- **完整 tempo map** —— 每个 `set_tempo` 都记录到 `tempo_map: List[(tick, microsec/beat)]`；`tick → seconds` 用分段积分而不是「先取一个 BPM 再乘」。
+- **duration 加权 dominant BPM** —— 当存在多个 tempo 段时，`bpm` 取覆盖 tick 数最多的那段（而不是简单取最后一个或最初一个），ritardando 不会污染整曲 BPM。
+- **time-signature 取首个事件**（一般在 conductor track），不被后续 track 的杂项覆盖。
+- 每个 `NoteEvent` 在解析阶段就基于 tempo_map 算好 `time_seconds` / `duration_seconds`，下游不再以恒定 BPM 重新推算。
+
+`feature_extractor.py` 在 `sample_times`（50 Hz）网格上输出以下特征。所有特征均与同一时间轴对齐。
+
+| 特征 | 计算方式 | 用途 |
+|---|---|---|
+| `onset_strength` | 每帧 max(`velocity/127`) | 节拍重音强度调制 |
+| `note_density` | onset 计数 × 高斯平滑（~1.5 拍） | 段落能量曲线 |
+| `energy` | 0.6 · density + 0.4 · 平滑 accent | `pca_motion` 的能量包络直接使用 |
+| `beat_phase` | `(t · bps) % 1` | PC1 节拍正弦 |
+| `is_beat` / `is_downbeat` | 向量化 nearest-beat 检测 | step/stride 触发 |
+| `metric_accent` | 节拍位置 → 0–1（downbeat=1.0、其他根据 time-sig 层级） | 强弱拍权重 |
+| `pitch_level` | **note_on→note_off 整段填充** 后高斯平滑 | PC4 yaw 扭转、PC7 register 抬升 |
+| `pitch_contour` | `pitch_level` 的梯度 × 拍长，clip 到 ±1 | 辅助节拍调制 |
+| `accent` | 0.50·metric + 0.25·velocity_dev + 0.15·duration + 0.10·pitch_leap | 综合重音（机控 MIDI 也能产生有意义信号） |
+| `is_low_note` | 低音 (pitch ≤ min+40% range) **沿持续时长填充** | PC2 跨步触发条件 |
+| `phrase_boundaries` | onset 间隔 ≥ 2 拍 ∪ 8 小节定时网格 ∪ 静音段恢复点 | PC5 乐句呼吸、PC4 乐句脉冲 |
+| `bpm` / `time_signature` | tempo_map 加权 / 首个 time-sig 事件 | 所有周期/节拍计算的基础 |
+
+> **关键修复（对比旧版）：** 旧 `pitch_level` 只在 onset 帧赋值（占 ~3% 帧），高斯平滑后塌缩到 ≈0.01；旧 `is_low_note` 同问题，4 个示例曲只有 0.8%–2.8% 帧标 1；旧 `accent` 只用 velocity 阈值，而机控 MIDI 的 velocity std ≈ 2 rad，重音几乎是噪声。重写后 4 个曲子 step 触发数从 2–6 提升到 8–14（详见下表）。
+
+| 示例曲 | BPM | 旧 pitch_level max | 新 pitch_level max | 旧 step 候选 | 新 step 候选 |
+|---|---|---|---|---|---|
+| yellow_bass | 86 | 0.029 | **1.000** | 6 | **14** |
+| 为你着迷 | 116 | 0.034 | **0.930** | 2 | **13** |
+| 光辉岁月 | 70 | 0.019 | **0.800** | 2 | **10** |
+| 难忘今宵 | 56 | 0.013 | **0.857** | 6 | **8** |
 
 ### 安全约束
 

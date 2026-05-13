@@ -28,15 +28,17 @@ Each PC is driven by the musical event that naturally fits its motion type:
 
 Architecture:
     Continuous multi-sine carriers (one per PC, incommensurate frequencies)
-    provide non-repeating baseline motion.  A musical-energy envelope derived
-    from onset density and accent strength scales the carriers so that dense /
-    energetic passages produce larger movements and sparse passages stay
-    subtle.  Event-driven accents (per the table above) are added on top.  An
-    explicit `_identify_step_events` layer triggers visible foot-lifts on
-    strong accented downbeats; while a step is active a rhythm-suppression
-    mask silences all PC activations and groove patterns so the step reads
-    cleanly.  Finally, beat-synced groove patterns target hip/knee/waist
-    joints directly with absolute-radian amplitudes.
+    provide non-repeating baseline motion.  The pre-computed
+    `features.energy` envelope from `feature_extractor.py` (which already
+    blends smoothed note-density and metric-aware accent) modulates the
+    carriers so that dense / energetic passages produce larger movements
+    and sparse passages stay subtle.  Event-driven accents (per the table
+    above) are added on top.  An explicit `_identify_step_events` layer
+    triggers visible foot-lifts on strong accented downbeats; while a
+    step is active a rhythm-suppression mask silences all PC activations
+    and groove patterns so the step reads cleanly.  Finally, beat-synced
+    groove patterns target hip/knee/waist joints directly with absolute-
+    radian amplitudes.
 
 Reconstruction:
     lower_trajs[t] = mean_pose + sum_i(activation_i[t] * component[i])
@@ -136,33 +138,14 @@ def _continuous_carriers(
 
 
 # ---------------------------------------------------------------------------
-# Musical energy envelope  (onset density + accent  ->  amplitude modulator)
+# Musical energy
 # ---------------------------------------------------------------------------
-
-def _musical_energy_envelope(
-    n: int,
-    dt: float,
-    onset_indices: np.ndarray,
-    onset_strength: np.ndarray,
-    accent: np.ndarray,
-    bpm: float,
-) -> np.ndarray:
-    """Smooth musical-energy envelope in [0, 1] from onset density and accent.
-
-    Smoothed over ~2 beats so it rises/falls with musical phrases rather than
-    individual notes.
-    """
-    spb = 60.0 / bpm if bpm > 0 else 0.5
-    raw = np.zeros(n)
-    for idx in onset_indices:
-        if idx < n:
-            raw[idx] += onset_strength[idx] * 0.7 + accent[idx] * 0.3
-    sigma = max(int(2.0 * spb / dt), 2)
-    energy = gaussian_filter1d(raw, sigma=sigma)
-    e_max = np.max(energy)
-    if e_max > 1e-10:
-        energy /= e_max
-    return energy
+#
+# `feature_extractor.extract_features` already computes a per-sample
+# `energy` signal (≈ 0.6·smoothed_note_density + 0.4·smoothed_accent) that
+# captures section-level musical energy more cleanly than re-smoothing raw
+# onsets here.  We therefore consume `features.energy` directly in
+# `generate_pca_motion` instead of recomputing it.
 
 
 # ---------------------------------------------------------------------------
@@ -373,11 +356,8 @@ def _phrase_breath_accent(
 
 
 def _density_sway_accent(
-    n: int,
     sample_times: np.ndarray,
-    dt: float,
-    onset_indices: np.ndarray,
-    onset_strength: np.ndarray,
+    note_density: np.ndarray,
     bpm: float,
     amplitude: float,
     sway_period_beats: float = 48.0,
@@ -387,23 +367,15 @@ def _density_sway_accent(
     period) carries the body left/right, and rhythmic note density
     determines how much sway is allowed.  Quiet passages stay near
     upright; dense passages get full sway.
+
+    `note_density` comes from `features.note_density` (pre-smoothed in the
+    feature extractor); we consume it directly instead of re-smoothing
+    raw onsets here.
     """
-    impulse = np.zeros(n)
-    for idx in onset_indices:
-        if idx < n:
-            impulse[idx] += onset_strength[idx]
-
     spb = 60.0 / bpm if bpm > 0 else 0.5
-    sigma = max(int(2.0 * spb / dt), 2)
-    density = gaussian_filter1d(impulse, sigma=sigma)
-    d_max = float(np.max(density))
-    if d_max > 1e-10:
-        density /= d_max
-
     sign_period = sway_period_beats * spb
     sign_osc = np.sin(2 * np.pi * sample_times / sign_period)
-
-    activation = density * sign_osc * amplitude * 0.8
+    activation = note_density * sign_osc * amplitude * 0.8
     return np.clip(activation, -amplitude * 1.1, amplitude * 1.1)
 
 
@@ -673,11 +645,19 @@ def generate_pca_motion(
     # -- Continuous carriers (always-on, never-repeating baseline motion) --
     carriers = _continuous_carriers(n, sample_times, n_comp)
 
-    # -- Musical energy envelope (0-1, scales carrier amplitude) --
-    energy = _musical_energy_envelope(
-        n, dt, features.onset_indices, features.onset_strength,
-        features.accent, features.bpm,
-    )
+    # -- Musical energy envelope (0-1, scales carrier amplitude).
+    #    Use the pre-computed, metric-aware energy from feature extraction
+    #    (≈0.6·smoothed_note_density + 0.4·smoothed_accent).  If an older
+    #    MusicalFeatures lacking this field is passed in, fall back to
+    #    smoothed onset_strength so external callers don't break.
+    energy = getattr(features, "energy", None)
+    if energy is None or len(energy) != n:
+        spb = 60.0 / features.bpm if features.bpm > 0 else 0.5
+        smooth_sigma = max(int(2.0 * spb / dt), 2)
+        energy = gaussian_filter1d(features.onset_strength, sigma=smooth_sigma)
+        e_max = float(np.max(energy))
+        if e_max > 1e-10:
+            energy = energy / e_max
 
     # -- Step events: identified up front so rhythm can be suppressed --
     left_step, right_step = _identify_step_events(sample_times, features, energy)
@@ -743,9 +723,11 @@ def generate_pca_motion(
 
     if n_comp >= 6:
         # PC6: anti-sym hip-roll body sway ← density × slow sine
+        note_density = getattr(features, "note_density", None)
+        if note_density is None or len(note_density) != n:
+            note_density = energy
         activations[:, 5] += _density_sway_accent(
-            n, sample_times, dt, features.onset_indices,
-            features.onset_strength, features.bpm,
+            sample_times, note_density, features.bpm,
             amplitude=amps[5] * 1.4,
         )
 
