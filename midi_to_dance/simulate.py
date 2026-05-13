@@ -92,6 +92,45 @@ def _compute_support_center(data, left_ankle_id, right_ankle_id):
     return (left + right) / 2.0
 
 
+def _smooth_kinematic_display_sequence(
+    qpos_sequence: np.ndarray,
+    qpos_map: dict,
+    dt: float,
+) -> None:
+    """Low-pass floating-base qpos (0:7) + waist_yaw along time (in-place).
+
+    Per-frame IK + ZMP + Jacobian anchoring can leave rapid frame-to-frame
+    changes in XY, yaw, and pitch compensation; the arm pose is fixed in
+    joint space but the whole upper body inherits world-frame shake from the
+    base.  Mild Gaussian smoothing (~50 ms) removes that viewer chatter
+    without re-running contact IK.
+    """
+    from scipy.ndimage import gaussian_filter1d
+
+    n = qpos_sequence.shape[0]
+    if n < 3:
+        return
+    dt = max(float(dt), 1e-6)
+    sig = max(min(2.4, 0.048 / dt), 0.7)
+
+    for d in range(3):
+        qpos_sequence[:, d] = gaussian_filter1d(
+            qpos_sequence[:, d], sigma=sig, mode="nearest",
+        )
+    quat = qpos_sequence[:, 3:7].copy()
+    sig_q = sig * 0.78
+    for d in range(4):
+        quat[:, d] = gaussian_filter1d(quat[:, d], sigma=sig_q, mode="nearest")
+    norms = np.linalg.norm(quat, axis=1, keepdims=True)
+    qpos_sequence[:, 3:7] = quat / np.maximum(norms, 1e-9)
+
+    idx = qpos_map.get("waist_yaw")
+    if idx is not None:
+        qpos_sequence[:, idx] = gaussian_filter1d(
+            qpos_sequence[:, idx], sigma=sig * 1.2, mode="nearest",
+        )
+
+
 def load_trajectory(csv_path: str, fps: float = 50.0):
     """Load CSV trajectory into (timestamps, joint_data dict, joint_names).
 
@@ -283,6 +322,10 @@ def main():
                              "values delay motion (use if motion looks "
                              "ahead of audio); negative values advance "
                              "motion (use if motion looks behind audio).")
+    parser.add_argument("--no-display-smoothing", action="store_true",
+                        help="Kinematic mode only: skip post-IK temporal "
+                             "smoothing of base pose + waist_yaw (default "
+                             "applies ~50 ms Gauss blur to reduce jitter).")
     args = parser.parse_args()
 
     # Load trajectory
@@ -694,6 +737,10 @@ def main():
                 print(f"\r  ... {pct:.0f}% ({frame + 1}/{n_frames} frames)", end="", flush=True)
         print()  # newline after progress
 
+        if not args.no_display_smoothing:
+            _smooth_kinematic_display_sequence(qpos_sequence, qpos_map, dt_traj)
+            print("  Display smoothing applied (floating base + waist_yaw)")
+
     # Audio playback via aplay/paplay
     audio_proc = None
     temp_wav = None
@@ -768,9 +815,10 @@ def main():
         right_ankle_id_bal = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY,
                                                 "right_leg_ankle_roll_link")
         BALANCE_KP = 1.2
-        BALANCE_KD = 0.08
+        BALANCE_KD = 0.035
         BALANCE_COM_H = 0.85
         prev_com_error_x = 0.0
+        balance_d_lp = 0.0
 
     # Apply user-tunable audio-offset to compensate for player startup
     # latency (paplay/aplay typically buffer ~50–100 ms before audible).
@@ -808,10 +856,17 @@ def main():
                     )
                     com = _compute_robot_com(model, data)
                     com_error_x = support_center[0] - com[0]
-                    d_error_x = (com_error_x - prev_com_error_x) / max(dt_traj, 1e-6)
+                    d_error_x = float(
+                        np.clip(
+                            (com_error_x - prev_com_error_x) / max(dt_traj, 1e-6),
+                            -2.5,
+                            2.5,
+                        )
+                    )
+                    balance_d_lp = 0.55 * balance_d_lp + 0.45 * d_error_x
 
                     pitch_adj = (com_error_x / BALANCE_COM_H * BALANCE_KP
-                                 + d_error_x * BALANCE_KD)
+                                 + balance_d_lp * BALANCE_KD)
 
                     for side in ["left", "right"]:
                         csv_pp = f"{side}_leg_pelvic_pitch"

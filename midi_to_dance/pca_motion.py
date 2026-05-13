@@ -481,7 +481,7 @@ def _groove_patterns(
 
     # ---- Pattern 2: Double-time bounce (eighth notes, high energy only) ----
     high_energy = np.clip((energy - 0.35) * 2.0, 0.0, 1.0)
-    dbl = np.cos(4 * np.pi * beat_phase) * 0.04 * scale * high_energy * weights[:, 1]
+    dbl = np.cos(4 * np.pi * beat_phase) * 0.03 * scale * high_energy * weights[:, 1]
     lower_trajs[:, _L_KNEE] += dbl
     lower_trajs[:, _R_KNEE] += dbl
 
@@ -513,15 +513,18 @@ def _groove_patterns(
         if idx >= n:
             continue
         if features.accent[idx] > 0.3:
-            amp = features.onset_strength[idx] * 0.05 * scale
+            amp = features.onset_strength[idx] * 0.04 * scale
             end_idx = min(idx + decay_s, n)
             t_decay = np.arange(end_idx - idx) * dt
             snap[idx:end_idx] += amp * np.exp(-t_decay / 0.08)
     snap *= energy
+    # Dense MIDI onsets stack many exponentials → high-frequency waist jitter in
+    # the viewer; blur the envelope before applying to the torso proxy (waist).
+    snap = gaussian_filter1d(snap, sigma=max(int(0.05 / dt), 2))
     snap_dir = np.sign(np.sin(np.pi * beats))
-    lower_trajs[:, _WAIST] += snap * snap_dir * 0.8
-    lower_trajs[:, _L_HIP_Y] += snap * snap_dir * 0.3
-    lower_trajs[:, _R_HIP_Y] += snap * snap_dir * 0.3
+    lower_trajs[:, _WAIST] += snap * snap_dir * 0.55
+    lower_trajs[:, _L_HIP_Y] += snap * snap_dir * 0.25
+    lower_trajs[:, _R_HIP_Y] += snap * snap_dir * 0.25
 
 
 # ---------------------------------------------------------------------------
