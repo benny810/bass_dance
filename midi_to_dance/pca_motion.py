@@ -1,16 +1,42 @@
 """Generate lower-body dance motion from music features using PCA primitives.
 
-The PCA model is pre-computed by pca_extractor.py from mocap example data.
-Each principal component captures a natural motion coordination pattern.
-Music features modulate the activation (coefficient) of each PC over time.
+The PCA model is pre-computed by `pca_extractor.py` from mocap example data
+after high-pass detrending + mirror augmentation, so each PC is either purely
+bilaterally symmetric or purely anti-symmetric.  The default variance-ordered
+PCs (see README) carry the following semantics, which are used as fixed slot
+assignments below:
+
+    PC1 ─ anti-sym front/back weight rock (R/L ankle pitch & hip pitch flip)
+    PC2 ─ anti-sym lateral knee shift     (one knee bends while the other
+                                          extends; ankle roll same direction)
+    PC3 ─ sym squat                        (both knees flex, ankles pitch back)
+    PC4 ─ anti-sym whole-body yaw twist    (both pelvic yaws turn together)
+    PC5 ─ sym forward lean                 (both hip pitches forward)
+    PC6 ─ anti-sym body sway / hip roll    (both hip rolls same direction =
+                                          full-body lateral lean)
+    PC7 ─ sym subtle extension             (ankles + knees rise)
+
+Each PC is driven by the musical event that naturally fits its motion type:
+
+    PC1 ← beat-phase sine          (alternates L/R every half beat)
+    PC2 ← accented-onset stride    (ADSR, sign alternates per trigger)
+    PC3 ← onset knee-flex impulse  (exponentially decaying flex on each onset)
+    PC4 ← pitch + measure twist    (pitch deviation × measure-wave × phrase)
+    PC5 ← phrase breathing arc     (slow cosine per musical phrase)
+    PC6 ← density × slow sway      (note density × ~48-beat-period sine)
+    PC7 ← pitch register           (high notes raise the body via tanh)
 
 Architecture:
     Continuous multi-sine carriers (one per PC, incommensurate frequencies)
     provide non-repeating baseline motion.  A musical-energy envelope derived
     from onset density and accent strength scales the carriers so that dense /
-    energetic passages produce larger movements and sparse passages stay subtle.
-    Event-driven accents (onset flex, accent stride, phrase pulses) are added
-    on top, contributing ~30% of total energy.
+    energetic passages produce larger movements and sparse passages stay
+    subtle.  Event-driven accents (per the table above) are added on top.  An
+    explicit `_identify_step_events` layer triggers visible foot-lifts on
+    strong accented downbeats; while a step is active a rhythm-suppression
+    mask silences all PC activations and groove patterns so the step reads
+    cleanly.  Finally, beat-synced groove patterns target hip/knee/waist
+    joints directly with absolute-radian amplitudes.
 
 Reconstruction:
     lower_trajs[t] = mean_pose + sum_i(activation_i[t] * component[i])
@@ -74,17 +100,19 @@ def _load_pca_model(pca_model_path: Optional[str] = None) -> dict:
 # Continuous carriers  (non-repeating baseline motion for every PC)
 # ---------------------------------------------------------------------------
 
-# Each PC gets 3 incommensurate sine periods (seconds).  The ratios are chosen
-# so the combined signal never exactly repeats within a typical song length.
-# Frequencies are in the 0.02-0.35 Hz range, matching mocap dominant spectra.
+# Per-PC incommensurate sine periods (seconds).  Frequency ratios are
+# irrational so each carrier's 3-sine sum never exactly repeats within song
+# length.  Period magnitudes are tuned per-PC to match the new (variance-
+# ordered) semantics: dominant rocking/stepping PCs get visible mid-tempo
+# baseline motion; lean/extension PCs sit on slow breathing-tempo carriers.
 _CARRIER_PERIODS = [
-    [8.3, 17.7, 35.1],    # PC1 – weighted sway (symmetric ankle + hip pitch)
-    [5.7, 13.3, 29.5],    # PC2 – lateral step (anti-symmetric knee)
-    [3.1, 7.9, 19.3],     # PC3 – symmetric squat (symmetric knee bend)
-    [11.2, 23.4, 41.7],   # PC4 – pelvic yaw (symmetric pelvic yaw)
-    [6.5, 15.1, 31.8],    # PC5 – forward lean (symmetric hip pitch)
-    [9.7, 21.1, 37.3],    # PC6 – lateral lean (symmetric hip roll)
-    [14.3, 27.6, 43.9],   # PC7 – full stretch (symmetric ankle + knee extension)
+    [4.7, 11.3, 23.5],    # PC1 anti-sym weight rock  — visible groove tempo
+    [7.9, 17.1, 31.2],    # PC2 anti-sym lateral step — slower deliberate sway
+    [9.1, 19.7, 35.4],    # PC3 sym squat             — slow continuous flex
+    [5.7, 13.3, 29.5],    # PC4 anti-sym yaw twist    — mid-tempo body twist
+    [14.3, 27.6, 43.9],   # PC5 sym forward lean      — slow breathing
+    [10.5, 22.3, 39.1],   # PC6 anti-sym body sway    — slow lateral lean
+    [16.7, 30.2, 47.3],   # PC7 sym extension         — slowest, subtle rise
 ]
 
 
@@ -139,38 +167,43 @@ def _musical_energy_envelope(
 
 # ---------------------------------------------------------------------------
 # Event-driven accent envelopes  (~30% of total energy)
+#
+# Each function returns an (n,)-shaped activation array intended to be added
+# to one specific PC's column.  Function name describes the musical driver;
+# its docstring records which PC slot it is wired to and what the activation
+# sign means in joint space.  Wiring lives in `generate_pca_motion`.
 # ---------------------------------------------------------------------------
 
-def _pc1_onset_accent(
+def _beat_rock_accent(
     n: int,
     dt: float,
+    beat_phase: np.ndarray,
     onset_indices: np.ndarray,
     onset_strength: np.ndarray,
-    beat_phase: np.ndarray,
-    accent: np.ndarray,
-    depth: float,
-    decay_time: float = 0.15,
+    amplitude: float,
 ) -> np.ndarray:
-    """PC1 (weighted sway) onset accent: note onsets trigger knee-flex impulse."""
-    activation = np.zeros(n)
-    decay_samples = int(decay_time / dt)
+    """Beat-phase sine wave, gated by local onset density.  Wired to PC1
+    (anti-sym weight rock): activation > 0 lifts L heel / R toe, activation
+    < 0 inverts, giving an alternating L↔R weight rock that lands on
+    beats.
+    """
+    activation = np.sin(2 * np.pi * beat_phase) * amplitude * 0.6
 
+    onset_env = np.zeros(n)
     for idx in onset_indices:
-        if idx >= n:
-            continue
-        is_downbeat_like = beat_phase[idx] < 0.25
-        amp = depth if is_downbeat_like else depth * 0.6
-        amp *= 0.7 + 0.3 * onset_strength[idx]
-        amp += accent[idx] * depth * 0.4
-        amp = -amp  # negative = flex
+        if idx < n:
+            onset_env[idx] += onset_strength[idx]
+    sigma = max(int(0.1 / dt), 2)
+    onset_env = gaussian_filter1d(onset_env, sigma=sigma)
+    env_max = float(np.max(onset_env))
+    if env_max > 1e-10:
+        onset_env /= env_max
 
-        for j in range(min(decay_samples, n - idx)):
-            activation[idx + j] += amp * np.exp(-j * dt / decay_time)
-
-    return np.clip(activation, -depth * 2.0, 0.0)
+    activation *= 0.4 + 0.6 * onset_env
+    return np.clip(activation, -amplitude * 1.2, amplitude * 1.2)
 
 
-def _pc4_accent_envelope(
+def _stride_accent(
     n: int,
     sample_times: np.ndarray,
     dt: float,
@@ -181,41 +214,93 @@ def _pc4_accent_envelope(
     amplitude: float,
     hold_beats: float = 3.0,
 ) -> np.ndarray:
-    """PC4 (pelvic yaw) accent: accented low-note downbeats trigger ADSR pelvic yaw."""
+    """ADSR envelope triggered by accented low-note downbeats, with sign
+    alternating per trigger.  Wired to PC2 (anti-sym lateral knee shift):
+    +activation bends L knee while extending R (weight on right foot);
+    next trigger flips the sign so successive accents lean the body to
+    alternating sides.
+
+    Most triggers also coincide with `_identify_step_events`; the global
+    rhythm-suppression mask zeros this out during an explicit step so the
+    two layers don't fight.  The remaining triggers (low + downbeat but
+    not strong enough for an explicit step) still produce a subtle
+    side-lean cue.
+    """
     bps = bpm / 60.0
     spb = 60.0 / bpm if bpm > 0 else 0.5
 
-    trigger_indices = []
-    last_trigger_beat = -20.0
+    triggers = []
+    last_beat = -20.0
     for i in range(n):
         if is_downbeat[i] > 0.5 and accent[i] > 0.2 and is_low_note[i] > 0.5:
             beat_at_i = sample_times[i] * bps
-            if beat_at_i - last_trigger_beat >= 8.0:
-                trigger_indices.append(i)
-                last_trigger_beat = beat_at_i
+            if beat_at_i - last_beat >= 8.0:
+                triggers.append(i)
+                last_beat = beat_at_i
 
     activation = np.zeros(n)
-    for ti in trigger_indices:
-        attack_s = int(0.3 * spb / dt)
-        for j in range(min(attack_s, n - ti)):
-            activation[ti + j] = amplitude * np.sqrt(j / max(attack_s - 1, 1))
+    attack_s = max(int(0.3 * spb / dt), 1)
+    hold_s = max(int(hold_beats * spb / dt), 1)
+    release_s = max(int(0.5 * spb / dt), 1)
 
-        hold_s = int(hold_beats * spb / dt)
+    sign = 1.0
+    for ti in triggers:
+        amp_signed = sign * amplitude
+
+        for j in range(min(attack_s, n - ti)):
+            activation[ti + j] = amp_signed * np.sqrt(j / max(attack_s - 1, 1))
+
         hold_start = ti + attack_s
         for j in range(min(hold_s, n - hold_start)):
-            activation[hold_start + j] = amplitude * (1.0 - 0.3 * j / max(hold_s, 1))
+            activation[hold_start + j] = amp_signed * (1.0 - 0.3 * j / hold_s)
 
         release_start = hold_start + hold_s
-        release_s = int(0.5 * spb / dt)
-        for j in range(min(release_s, n - release_start)):
-            remaining = activation[max(0, release_start - 1)] if release_start > 0 else 0.0
-            if remaining > 0:
-                activation[release_start + j] = remaining * (1.0 - j / max(release_s, 1)) ** 2
+        if release_start > 0 and release_start < n:
+            peak_at_release = activation[release_start - 1]
+            for j in range(min(release_s, n - release_start)):
+                activation[release_start + j] = (
+                    peak_at_release * (1.0 - j / release_s) ** 2
+                )
 
-    return np.clip(activation, 0.0, amplitude * 1.2)
+        sign = -sign
+
+    return np.clip(activation, -amplitude * 1.2, amplitude * 1.2)
 
 
-def _pc2_pitch_accent(
+def _squat_flex_accent(
+    n: int,
+    dt: float,
+    onset_indices: np.ndarray,
+    onset_strength: np.ndarray,
+    beat_phase: np.ndarray,
+    accent: np.ndarray,
+    depth: float,
+    decay_time: float = 0.15,
+) -> np.ndarray:
+    """Exponentially-decaying impulse on each note onset (downbeats deeper).
+    Wired to PC3 (sym squat): activation > 0 drives both knees toward
+    deeper bend and both ankle pitches toward "back" — a coordinated
+    bilateral squat dip on each onset.  Signs intentionally produce
+    positive activations only (a flex, never an over-extension).
+    """
+    activation = np.zeros(n)
+    decay_samples = max(int(decay_time / dt), 1)
+
+    for idx in onset_indices:
+        if idx >= n:
+            continue
+        is_downbeat_like = beat_phase[idx] < 0.25
+        amp = depth if is_downbeat_like else depth * 0.6
+        amp *= 0.7 + 0.3 * onset_strength[idx]
+        amp += accent[idx] * depth * 0.4
+
+        for j in range(min(decay_samples, n - idx)):
+            activation[idx + j] += amp * np.exp(-j * dt / decay_time)
+
+    return np.clip(activation, 0.0, depth * 2.0)
+
+
+def _yaw_twist_accent(
     n: int,
     sample_times: np.ndarray,
     dt: float,
@@ -225,15 +310,20 @@ def _pc2_pitch_accent(
     phrase_boundaries: Set[int],
     amplitude: float,
 ) -> np.ndarray:
-    """PC2 (lateral step) accent: pitch-level modulation + measure wave + phrase pulses."""
-    pitch_dev = pitch_level - np.mean(pitch_level)
+    """Pitch deviation × measure-wave × phrase pulse.  Wired to PC4
+    (anti-sym whole-body yaw twist): both pelvic yaws turn together,
+    rotating the lower body about the vertical axis to follow the melodic
+    contour and punctuate phrase boundaries.
+    """
+    pitch_mean = float(np.mean(pitch_level))
+    pitch_dev = pitch_level - pitch_mean
 
     beats_per_measure = time_signature[0]
-    sec_per_measure = beats_per_measure * 60.0 / bpm
+    sec_per_measure = beats_per_measure * 60.0 / bpm if bpm > 0 else 2.0
     measure_wave = np.sin(2 * np.pi * sample_times / sec_per_measure) * 0.4
 
     phrase_pulse = np.zeros(n)
-    pulse_samples = int(sec_per_measure / dt)
+    pulse_samples = max(int(sec_per_measure / dt), 1)
     for bi in phrase_boundaries:
         if bi < n:
             for j in range(min(pulse_samples, n - bi)):
@@ -244,72 +334,7 @@ def _pc2_pitch_accent(
     return np.clip(activation, -amplitude * 1.5, amplitude * 1.5)
 
 
-def _pc3_beat_accent(
-    n: int,
-    dt: float,
-    beat_phase: np.ndarray,
-    onset_indices: np.ndarray,
-    onset_strength: np.ndarray,
-    amplitude: float,
-) -> np.ndarray:
-    """PC3 (symmetric squat) accent: beat-synced knee bend, modulated by onset envelope."""
-    activation = np.sin(2 * np.pi * beat_phase) * amplitude * 0.5
-
-    onset_env = np.zeros(n)
-    for idx in onset_indices:
-        if idx < n:
-            onset_env[idx] += onset_strength[idx]
-    sigma = max(int(0.1 / dt), 2)
-    onset_env = gaussian_filter1d(onset_env, sigma=sigma)
-
-    activation *= 0.3 + 0.7 * onset_env
-    return activation
-
-
-def _pc5_density_accent(
-    n: int,
-    sample_times: np.ndarray,
-    dt: float,
-    onset_indices: np.ndarray,
-    onset_strength: np.ndarray,
-    bpm: float,
-    amplitude: float,
-) -> np.ndarray:
-    """PC5 (forward lean) accent: rhythmic note density drives forward-back hip pitch."""
-    impulse = np.zeros(n)
-    for idx in onset_indices:
-        if idx < n:
-            impulse[idx] += onset_strength[idx]
-
-    spb = 60.0 / bpm if bpm > 0 else 0.5
-    sigma = max(int(2.0 * spb / dt), 2)
-    density = gaussian_filter1d(impulse, sigma=sigma)
-    d_max = np.max(density)
-    if d_max > 1e-10:
-        density /= d_max
-
-    sign_period = 48.0 * spb
-    sign_osc = np.sin(2 * np.pi * sample_times / sign_period)
-
-    activation = density * sign_osc * amplitude * 0.6
-    return np.clip(activation, -amplitude * 0.9, amplitude * 0.9)
-
-
-def _pc6_register_accent(
-    n: int,
-    pitch_level: np.ndarray,
-    amplitude: float,
-) -> np.ndarray:
-    """PC6 (lateral lean) accent: pitch register drives body sway via hip roll."""
-    centered = pitch_level - np.mean(pitch_level)
-    std = np.std(pitch_level)
-    if std > 1e-10:
-        centered /= std
-    activation = np.tanh(centered) * amplitude * 0.6
-    return np.clip(activation, -amplitude * 1.2, amplitude * 1.2)
-
-
-def _pc7_phrase_accent(
+def _phrase_breath_accent(
     n: int,
     sample_times: np.ndarray,
     bpm: float,
@@ -317,10 +342,15 @@ def _pc7_phrase_accent(
     phrase_boundaries: Set[int],
     amplitude: float,
 ) -> np.ndarray:
-    """PC7 (full stretch) accent: phrase-level breathing arc drives ankle + knee extension."""
+    """Slow cosine arc spanning each musical phrase.  Wired to PC5
+    (sym forward lean): activation > 0 → both hip pitches forward
+    (upright), activation < 0 → slight stoop.  Produces a breathing-like
+    rise and fall that tracks musical phrasing rather than individual
+    notes.
+    """
     boundaries = sorted(phrase_boundaries)
     if len(boundaries) == 0 or boundaries[0] != 0:
-        boundaries = [0] + boundaries
+        boundaries = [0] + list(boundaries)
 
     activation = np.zeros(n)
 
@@ -335,11 +365,64 @@ def _pc7_phrase_accent(
             activation[start:end] = np.cos(np.pi * phase)
     else:
         beats_per_measure = time_signature[0]
-        sec_per_measure = beats_per_measure * 60.0 / bpm
+        sec_per_measure = beats_per_measure * 60.0 / bpm if bpm > 0 else 2.0
         activation[:] = np.cos(2 * np.pi * sample_times / (sec_per_measure * 4.0))
 
-    activation *= amplitude * 0.5
-    return np.clip(activation, -amplitude * 0.6, amplitude * 0.6)
+    activation *= amplitude * 0.7
+    return np.clip(activation, -amplitude * 0.9, amplitude * 0.9)
+
+
+def _density_sway_accent(
+    n: int,
+    sample_times: np.ndarray,
+    dt: float,
+    onset_indices: np.ndarray,
+    onset_strength: np.ndarray,
+    bpm: float,
+    amplitude: float,
+    sway_period_beats: float = 48.0,
+) -> np.ndarray:
+    """Density-modulated slow lateral oscillation.  Wired to PC6
+    (anti-sym hip roll body sway): a very slow sine (~`sway_period_beats`
+    period) carries the body left/right, and rhythmic note density
+    determines how much sway is allowed.  Quiet passages stay near
+    upright; dense passages get full sway.
+    """
+    impulse = np.zeros(n)
+    for idx in onset_indices:
+        if idx < n:
+            impulse[idx] += onset_strength[idx]
+
+    spb = 60.0 / bpm if bpm > 0 else 0.5
+    sigma = max(int(2.0 * spb / dt), 2)
+    density = gaussian_filter1d(impulse, sigma=sigma)
+    d_max = float(np.max(density))
+    if d_max > 1e-10:
+        density /= d_max
+
+    sign_period = sway_period_beats * spb
+    sign_osc = np.sin(2 * np.pi * sample_times / sign_period)
+
+    activation = density * sign_osc * amplitude * 0.8
+    return np.clip(activation, -amplitude * 1.1, amplitude * 1.1)
+
+
+def _register_extension_accent(
+    n: int,
+    pitch_level: np.ndarray,
+    amplitude: float,
+) -> np.ndarray:
+    """Pitch register → small body rise/fall.  Wired to PC7 (sym subtle
+    extension): high notes (positive activation) lift ankles toward toe-up
+    plus slight knee bend; low notes settle the pose down.  `tanh` keeps
+    the response bounded for melodies with extreme leaps.
+    """
+    centered = pitch_level - float(np.mean(pitch_level))
+    std = float(np.std(pitch_level))
+    if std > 1e-10:
+        centered /= std
+    activation = np.tanh(centered) * amplitude * 0.6
+    return np.clip(activation, -amplitude * 1.0, amplitude * 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -603,64 +686,74 @@ def generate_pca_motion(
     masked_energy = energy * rhythm_mask
 
     # -- Build activation matrix --
-    # activation = carrier * modulated_energy * amplitude + accent
-    # Energy is squared to increase section-to-section contrast (quiet
-    # sections get much quieter, matching the 13:1 range seen in mocap).
+    # activation_i = carrier_i × envelope × std_score_i × CARRIER_GAIN
+    # The energy envelope is exponentiated (γ > 1) to widen the dynamic
+    # range so quiet passages stay subtle while loud ones bloom.
     activations = np.zeros((n, n_comp))
     base_level = 0.05
     dynamic_range = 0.95
+    envelope_gamma = 1.5
+    CARRIER_GAIN = 2.4   # boost slightly: detrended std_scores are ~0.4× of old
 
+    envelope = base_level + dynamic_range * (energy ** envelope_gamma)
     for i in range(n_comp):
-        envelope = base_level + dynamic_range * (energy ** 1.5)
-        activations[:, i] = carriers[:, i] * envelope * amps[i] * 2.0
+        activations[:, i] = carriers[:, i] * envelope * amps[i] * CARRIER_GAIN
 
-    # -- Event-driven accents (30% of energy) --
+    # -- Event-driven accents: each musical driver wired to the PC whose
+    #    natural coordination matches its motion (see module docstring) --
     if n_comp >= 1:
-        activations[:, 0] += _pc1_onset_accent(
-            n, dt, features.onset_indices, features.onset_strength,
-            features.beat_phase, features.accent,
-            depth=amps[0] * 1.0,
+        # PC1: anti-sym weight rock ← beat-phase sine
+        activations[:, 0] += _beat_rock_accent(
+            n, dt, features.beat_phase, features.onset_indices,
+            features.onset_strength,
+            amplitude=amps[0] * 1.5,
         )
 
     if n_comp >= 2:
-        activations[:, 1] += _pc2_pitch_accent(
-            n, sample_times, dt, features.pitch_level, features.bpm,
-            features.time_signature, features.phrase_boundaries,
-            amplitude=amps[1],
+        # PC2: anti-sym lateral step ← accented-onset stride ADSR
+        activations[:, 1] += _stride_accent(
+            n, sample_times, dt, features.accent, features.is_low_note,
+            features.is_downbeat, features.bpm,
+            amplitude=amps[1] * 1.5,
         )
 
     if n_comp >= 3:
-        activations[:, 2] += _pc3_beat_accent(
-            n, dt, features.beat_phase, features.onset_indices,
-            features.onset_strength,
-            amplitude=amps[2],
+        # PC3: sym squat ← onset knee-flex impulse (positive = bend)
+        activations[:, 2] += _squat_flex_accent(
+            n, dt, features.onset_indices, features.onset_strength,
+            features.beat_phase, features.accent,
+            depth=amps[2] * 2.0,
         )
 
     if n_comp >= 4:
-        activations[:, 3] += _pc4_accent_envelope(
-            n, sample_times, dt, features.accent, features.is_low_note,
-            features.is_downbeat, features.bpm,
-            amplitude=amps[3],
+        # PC4: anti-sym whole-body yaw twist ← pitch + measure wave
+        activations[:, 3] += _yaw_twist_accent(
+            n, sample_times, dt, features.pitch_level, features.bpm,
+            features.time_signature, features.phrase_boundaries,
+            amplitude=amps[3] * 1.5,
         )
 
     if n_comp >= 5:
-        activations[:, 4] += _pc5_density_accent(
-            n, sample_times, dt, features.onset_indices,
-            features.onset_strength, features.bpm,
-            amplitude=amps[4],
+        # PC5: sym forward lean ← phrase breathing arc
+        activations[:, 4] += _phrase_breath_accent(
+            n, sample_times, features.bpm, features.time_signature,
+            features.phrase_boundaries,
+            amplitude=amps[4] * 1.4,
         )
 
     if n_comp >= 6:
-        activations[:, 5] += _pc6_register_accent(
-            n, features.pitch_level,
-            amplitude=amps[5],
+        # PC6: anti-sym hip-roll body sway ← density × slow sine
+        activations[:, 5] += _density_sway_accent(
+            n, sample_times, dt, features.onset_indices,
+            features.onset_strength, features.bpm,
+            amplitude=amps[5] * 1.4,
         )
 
     if n_comp >= 7:
-        activations[:, 6] += _pc7_phrase_accent(
-            n, sample_times, features.bpm, features.time_signature,
-            features.phrase_boundaries,
-            amplitude=amps[6],
+        # PC7: sym subtle extension ← pitch register
+        activations[:, 6] += _register_extension_accent(
+            n, features.pitch_level,
+            amplitude=amps[6] * 1.2,
         )
 
     # -- Suppress all rhythm activations during step intervals --
