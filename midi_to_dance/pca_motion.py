@@ -106,6 +106,46 @@ def _load_pca_model(pca_model_path: Optional[str] = None) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Tempo-aware rhythm helpers (slow ballads vs. uptempo)
+# ---------------------------------------------------------------------------
+
+def _slow_tempo_weight(bpm: float) -> float:
+    """Return 0 for ~90+ BPM, ramping to 1 toward ~34 BPM.
+
+    Sparse slow bass lines normalise to a flat, low `energy` envelope; the
+    beat grid alone still carries musical time — we blend in that pulse so
+    carriers and grooves stay readable.
+    """
+    return float(np.clip((88.0 - bpm) / 54.0, 0.0, 1.0))
+
+
+def _metric_pulse(beat_phase: np.ndarray) -> np.ndarray:
+    """Per-beat modulation in [0.38, 1]: stronger on/near beats for slow-tempo fill."""
+    s = np.abs(np.sin(2 * np.pi * beat_phase))
+    c = np.cos(2 * np.pi * beat_phase) ** 2
+    return np.clip(0.38 + 0.35 * s + 0.27 * c, 0.0, 1.0)
+
+
+def _energy_with_slow_pulse(
+    energy: np.ndarray,
+    beat_phase: np.ndarray,
+    bpm: float,
+) -> np.ndarray:
+    """Boost low `energy` pockets at slow BPM using the metric pulse.
+
+    Sparse ballads still max-normalise to [0,1], but sustained quiet passages
+    sit near 0.3–0.5 — the carriers and grooves then *feel* flat.  We add
+    pulse·(1−E) so empty beats gain timing without squashing louder sections.
+    """
+    sw = _slow_tempo_weight(bpm)
+    if sw <= 1e-9:
+        return energy
+    pulse = _metric_pulse(beat_phase)
+    fill = sw * 0.40 * pulse * (1.0 - energy)
+    return np.clip(energy + fill, 0.0, 1.0)
+
+
+# ---------------------------------------------------------------------------
 # Continuous carriers  (non-repeating baseline motion for every PC)
 # ---------------------------------------------------------------------------
 
@@ -171,6 +211,7 @@ def _beat_rock_accent(
     onset_indices: np.ndarray,
     onset_strength: np.ndarray,
     amplitude: float,
+    bpm: float = 90.0,
 ) -> np.ndarray:
     """Beat-phase sine wave, gated by local onset density.  Wired to PC1
     (anti-sym weight rock): activation > 0 lifts L heel / R toe, activation
@@ -183,13 +224,22 @@ def _beat_rock_accent(
     for idx in onset_indices:
         if idx < n:
             onset_env[idx] += onset_strength[idx]
-    sigma = max(int(0.1 / dt), 2)
+    spb = 60.0 / bpm if bpm > 0 else 0.5
+    sw = _slow_tempo_weight(bpm)
+    # Fix 100 ms Gauss for uptempo; stretch toward ~0.4 beats at slow BPM so
+    # sparse quarter notes still "fill" the bar for the onset gate.
+    sigma_fast = max(int(0.10 / dt), 2)
+    sigma_slow = max(int((0.12 + 0.32 * sw) * spb / dt), 2)
+    sigma = max(sigma_fast, sigma_slow)
     onset_env = gaussian_filter1d(onset_env, sigma=sigma)
     env_max = float(np.max(onset_env))
     if env_max > 1e-10:
         onset_env /= env_max
 
-    activation *= 0.4 + 0.6 * onset_env
+    pulse = _metric_pulse(beat_phase)
+    gate = 0.38 + 0.62 * np.maximum(onset_env, sw * pulse)
+
+    activation *= gate
     return np.clip(activation, -amplitude * 1.2, amplitude * 1.2)
 
 
@@ -456,6 +506,10 @@ def _groove_patterns(
     beats = sample_times * bpm / 60.0
     beats_per_measure = max(features.time_signature[0], 1)
 
+    sw = _slow_tempo_weight(float(bpm))
+    pulse = _metric_pulse(beat_phase)
+    drive = (1.0 - 0.62 * sw) * energy + 0.62 * sw * np.maximum(energy, pulse)
+
     # ---- Section-based groove mode cycling ----
     boundaries = sorted(features.phrase_boundaries)
     if not boundaries or boundaries[0] != 0:
@@ -473,14 +527,15 @@ def _groove_patterns(
         weights[:, j] = gaussian_filter1d(weights[:, j], sigma=cf_sigma)
 
     # ---- Pattern 1: Beat bounce (knee flex on downbeats) ----
-    bounce = np.cos(2 * np.pi * beat_phase) * 0.08 * scale * energy * weights[:, 0]
+    bounce = np.cos(2 * np.pi * beat_phase) * 0.08 * scale * drive * weights[:, 0]
     lower_trajs[:, _L_KNEE] += bounce
     lower_trajs[:, _R_KNEE] += bounce
     lower_trajs[:, _L_HIP_P] -= bounce * 0.35
     lower_trajs[:, _R_HIP_P] -= bounce * 0.35
 
     # ---- Pattern 2: Double-time bounce (eighth notes, high energy only) ----
-    high_energy = np.clip((energy - 0.35) * 2.0, 0.0, 1.0)
+    he0 = 0.35 - 0.18 * sw
+    high_energy = np.clip((energy - he0) * (2.0 + 2.5 * sw), 0.0, 1.0)
     dbl = np.cos(4 * np.pi * beat_phase) * 0.03 * scale * high_energy * weights[:, 1]
     lower_trajs[:, _L_KNEE] += dbl
     lower_trajs[:, _R_KNEE] += dbl
@@ -490,19 +545,19 @@ def _groove_patterns(
     twist_half = np.sin(2 * np.pi * half_note_phase) * 0.06 * scale
     measure_phase = (beats % beats_per_measure) / beats_per_measure
     twist_measure = np.sin(2 * np.pi * measure_phase) * 0.04 * scale
-    twist = (twist_half + twist_measure) * energy * weights[:, 2]
+    twist = (twist_half + twist_measure) * drive * weights[:, 2]
     lower_trajs[:, _WAIST] += twist
     lower_trajs[:, _L_HIP_Y] += twist * 0.35
     lower_trajs[:, _R_HIP_Y] += twist * 0.35
 
     # ---- Pattern 4: Side-to-side sway (pelvic roll, 2-beat cycle) ----
-    sway = np.sin(2 * np.pi * half_note_phase) * 0.04 * scale * energy * weights[:, 3]
+    sway = np.sin(2 * np.pi * half_note_phase) * 0.04 * scale * drive * weights[:, 3]
     lower_trajs[:, _L_HIP_R] += sway
     lower_trajs[:, _R_HIP_R] -= sway
 
     # ---- Pattern 5: Forward-back pump (pelvic pitch, beat-synced) ----
     pump_phase = 2 * np.pi * beat_phase + np.pi / 6
-    pump = np.sin(pump_phase) * 0.05 * scale * energy * weights[:, 4]
+    pump = np.sin(pump_phase) * 0.05 * scale * drive * weights[:, 4]
     lower_trajs[:, _L_HIP_P] += pump
     lower_trajs[:, _R_HIP_P] += pump
 
@@ -517,7 +572,7 @@ def _groove_patterns(
             end_idx = min(idx + decay_s, n)
             t_decay = np.arange(end_idx - idx) * dt
             snap[idx:end_idx] += amp * np.exp(-t_decay / 0.08)
-    snap *= energy
+    snap *= drive
     # Dense MIDI onsets stack many exponentials → high-frequency waist jitter in
     # the viewer; blur the envelope before applying to the torso proxy (waist).
     snap = gaussian_filter1d(snap, sigma=max(int(0.05 / dt), 2))
@@ -721,6 +776,8 @@ def generate_pca_motion(
         if e_max > 1e-10:
             energy = energy / e_max
 
+    energy = _energy_with_slow_pulse(energy, features.beat_phase, float(features.bpm))
+
     # -- Step events: only the explicit single-leg lift layer is gated
     #    behind `enable_steps`.  When disabled (default) both step phase
     #    signals stay zero and the rhythm-suppression mask is all-ones,
@@ -760,6 +817,7 @@ def generate_pca_motion(
             n, dt, features.beat_phase, features.onset_indices,
             features.onset_strength,
             amplitude=amps[0] * 1.5,
+            bpm=float(features.bpm),
         )
 
     if n_comp >= 2:
