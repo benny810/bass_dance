@@ -276,6 +276,13 @@ def main():
                         help="Run physics dynamics simulation (default: kinematic)")
     parser.add_argument("--save-audio", type=str, default=None, metavar="PATH",
                         help="Save synthesized audio WAV to PATH and exit")
+    parser.add_argument("--audio-offset", type=float, default=0.0,
+                        metavar="SEC",
+                        help="Seconds to delay motion relative to audio "
+                             "Popen start time (default 0.0).  Positive "
+                             "values delay motion (use if motion looks "
+                             "ahead of audio); negative values advance "
+                             "motion (use if motion looks behind audio).")
     args = parser.parse_args()
 
     # Load trajectory
@@ -720,16 +727,25 @@ def main():
 
         if player:
             print(f"  Starting audio: {player} {wav_path}")
+            # Anchor the motion clock to *Popen return time*, not to a
+            # post-startup-check timestamp.  Sleeping for 0.5 s after Popen
+            # and *then* setting sim_start_time used to push the motion
+            # ~500 ms behind the audio because the player begins streaming
+            # as soon as the kernel schedules it (within a few ms), not
+            # 500 ms later.  We keep a short verify-sleep purely to
+            # surface immediate-exit failures.
+            audio_start_time = time.time()
             audio_proc = subprocess.Popen(
                 [player, wav_path],
                 stdout=subprocess.DEVNULL,
             )
-            time.sleep(0.5)
+            time.sleep(0.05)
             poll = audio_proc.poll()
             if poll is not None:
                 print(f"  WARNING: audio player exited early with code {poll}")
                 print(f"  The player command was: {player} {wav_path}")
                 print(f"  Try running it manually to see error details.")
+                audio_proc = None
             else:
                 print(f"  Audio player running (pid={audio_proc.pid})")
         else:
@@ -756,10 +772,17 @@ def main():
         BALANCE_COM_H = 0.85
         prev_com_error_x = 0.0
 
-    sim_start_time = time.time()
+    # Apply user-tunable audio-offset to compensate for player startup
+    # latency (paplay/aplay typically buffer ~50–100 ms before audible).
+    audio_offset = float(getattr(args, "audio_offset", 0.0))
     if audio_proc is not None:
-        print("  Audio + motion synced")
+        sim_start_time = audio_start_time + audio_offset
+        if audio_offset != 0.0:
+            print(f"  Audio + motion synced (audio_offset={audio_offset:+.3f}s)")
+        else:
+            print("  Audio + motion synced")
     else:
+        sim_start_time = time.time()
         print("  (no audio)")
 
     with mujoco.viewer.launch_passive(model, data) as viewer:

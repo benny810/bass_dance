@@ -33,24 +33,31 @@ Architecture:
     blends smoothed note-density and metric-aware accent) modulates the
     carriers so that dense / energetic passages produce larger movements
     and sparse passages stay subtle.  Event-driven accents (per the table
-    above) are added on top.  An explicit `_identify_step_events` layer
-    triggers visible foot-lifts on strong accented downbeats; while a
-    step is active a rhythm-suppression mask silences all PC activations
-    and groove patterns so the step reads cleanly.  Finally, beat-synced
-    groove patterns target hip/knee/waist joints directly with absolute-
-    radian amplitudes.
+    above) are added on top.  Finally, beat-synced groove patterns target
+    hip/knee/waist joints directly with absolute-radian amplitudes.
+
+    An optional `_identify_step_events` + `_apply_step_motion` layer
+    (gated behind `enable_steps`, OFF by default) triggers visible
+    foot-lifts on strong accented downbeats with a rhythm-suppression
+    mask that silences PC activations during the step.  This layer is
+    *not* derived from PCA primitives; leave it disabled for pure
+    music-driven dance.
 
 Reconstruction:
     lower_trajs[t] = mean_pose + sum_i(activation_i[t] * component[i])
 """
 
 from pathlib import Path
-from typing import Dict, Optional, Set
+from typing import Dict, Optional, Sequence, Set
 
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
 
 from .feature_extractor import MusicalFeatures
+
+# Default per-PC weight multiplier (applied on top of std_scores * scale).
+# Index i corresponds to PC(i+1).  See module docstring for PC semantics.
+DEFAULT_PC_WEIGHTS = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
 
 # 13 lower-body joints (must match JOINT_NAMES[:13] in trajectory_generator.py)
 LOWER_BODY_JOINTS = [
@@ -222,7 +229,12 @@ def _stride_accent(
                 last_beat = beat_at_i
 
     activation = np.zeros(n)
-    attack_s = max(int(0.3 * spb / dt), 1)
+    # Attack must be near-instant so the lateral lean peaks ON the
+    # trigger frame, not 0.3 beats after it.  We previously had a
+    # 0.3-beat √-rise which created a 150–320 ms perceptual lag at
+    # typical bass tempos.  A few-frame ramp (≈ 40 ms) preserves
+    # smoothness without delaying the visual peak.
+    attack_s = max(int(0.04 / dt), 1)
     hold_s = max(int(hold_beats * spb / dt), 1)
     release_s = max(int(0.5 * spb / dt), 1)
 
@@ -556,13 +568,25 @@ def _identify_step_events(
 
     step_dur = 1.5 * spb
     step_samples = max(int(step_dur / dt), 1)
+    half_step = step_samples // 2  # bell is centred on `ti`, not started at `ti`
     is_left = True
 
     for ti in triggers:
         step_arr = left_step if is_left else right_step
-        for j in range(min(step_samples, n - ti)):
+        # Place the sin² bell so its peak lands ON the trigger frame
+        # rather than `half_step` frames AFTER it.  This anticipates the
+        # beat (foot starts lifting before the music event, fully lifted
+        # ON the event, planted shortly after) which reads as visually
+        # in-sync with the audio.  Previously the peak sat at j=N/2 after
+        # the trigger, producing 0.75-beat (≈ 500–800 ms) lag at typical
+        # tempos.
+        start = ti - half_step
+        for j in range(step_samples):
+            idx = start + j
+            if idx < 0 or idx >= n:
+                continue
             bell = np.sin(np.pi * j / step_samples) ** 2
-            step_arr[ti + j] = max(step_arr[ti + j], bell)
+            step_arr[idx] = max(step_arr[idx], bell)
         is_left = not is_left
 
     sm = max(int(0.03 / dt), 1)
@@ -624,10 +648,34 @@ def generate_pca_motion(
     features: MusicalFeatures,
     scale: float = 1.0,
     pca_model: Optional[dict] = None,
+    pc_weights: Optional[Sequence[float]] = None,
+    enable_steps: bool = False,
 ) -> Dict[str, np.ndarray]:
     """Generate lower-body joint trajectories from PCA model + music features.
 
-    Returns dict mapping lower-body joint_name -> angle_array (radians, absolute).
+    Parameters
+    ----------
+    scale
+        Global multiplier applied to every PC.
+    pc_weights
+        Optional per-PC weight multipliers.  Length should match the number
+        of PCs in `pca_model` (typically 7); shorter sequences are right-
+        padded with 1.0 and longer ones are truncated.  Applied on top of
+        `scale` so the effective amplitude of PC*i* is
+        ``std_scores[i] * scale * pc_weights[i]`` and propagates uniformly
+        to both the continuous carrier and the event accent driving that PC.
+        Defaults to all-ones (no change vs. legacy behaviour).
+    enable_steps
+        If True, layer the hand-coded "single-leg lift" stepping events
+        (`_identify_step_events` + `_apply_step_motion`) on top of the
+        PCA-driven motion.  This layer is *not* part of the PCA primitives
+        and is OFF by default — it triggers occasional asymmetric leg
+        lifts on accented downbeats, which can read as a glitch rather
+        than music-driven dance.  Leave False for pure PCA-based motion.
+
+    Returns
+    -------
+    dict mapping lower-body joint_name -> angle_array (radians, absolute).
     """
     if pca_model is None:
         pca_model = _load_pca_model()
@@ -638,9 +686,20 @@ def generate_pca_motion(
     components = pca_model["components"]  # (n_comp, 13)
     mean_pose = pca_model["mean_pose"]     # (13,)
     std_scores = pca_model["std_scores"]   # (n_comp,)
-    n_comp = pca_model["n_components"]
+    n_comp = int(pca_model["n_components"])
 
-    amps = [std_scores[i] * scale for i in range(n_comp)]
+    if pc_weights is None:
+        weights = list(DEFAULT_PC_WEIGHTS)
+    else:
+        weights = [float(w) for w in pc_weights]
+    # Right-pad with 1.0 or truncate to match n_comp so callers can pass
+    # a shorter / longer list without crashing.
+    if len(weights) < n_comp:
+        weights = weights + [1.0] * (n_comp - len(weights))
+    else:
+        weights = weights[:n_comp]
+
+    amps = [std_scores[i] * scale * weights[i] for i in range(n_comp)]
 
     # -- Continuous carriers (always-on, never-repeating baseline motion) --
     carriers = _continuous_carriers(n, sample_times, n_comp)
@@ -659,10 +718,21 @@ def generate_pca_motion(
         if e_max > 1e-10:
             energy = energy / e_max
 
-    # -- Step events: identified up front so rhythm can be suppressed --
-    left_step, right_step = _identify_step_events(sample_times, features, energy)
-    step_active = np.maximum(left_step, right_step)
-    rhythm_mask = _rhythm_suppression_mask(step_active, dt)
+    # -- Step events: only the explicit single-leg lift layer is gated
+    #    behind `enable_steps`.  When disabled (default) both step phase
+    #    signals stay zero and the rhythm-suppression mask is all-ones,
+    #    so PCA motion plays uninterrupted and both feet remain anchored
+    #    in `simulate.py`.
+    if enable_steps:
+        left_step, right_step = _identify_step_events(
+            sample_times, features, energy,
+        )
+        step_active = np.maximum(left_step, right_step)
+        rhythm_mask = _rhythm_suppression_mask(step_active, dt)
+    else:
+        left_step = np.zeros(n)
+        right_step = np.zeros(n)
+        rhythm_mask = np.ones(n)
     masked_energy = energy * rhythm_mask
 
     # -- Build activation matrix --
@@ -739,7 +809,9 @@ def generate_pca_motion(
         )
 
     # -- Suppress all rhythm activations during step intervals --
-    activations *= rhythm_mask[:, np.newaxis]
+    #    No-op when `enable_steps` is False because rhythm_mask is all-ones.
+    if enable_steps:
+        activations *= rhythm_mask[:, np.newaxis]
 
     # -- Reconstruct: (n, 13) = mean + activations @ components --
     lower_trajs = mean_pose[np.newaxis, :] + activations @ components
@@ -759,7 +831,8 @@ def generate_pca_motion(
     lower_trajs[:, _R_HIP_P] = np.maximum(lower_trajs[:, _R_HIP_P], _HIP_PITCH_MIN)
 
     # -- Apply step motion last so it's the only motion during a step --
-    _apply_step_motion(lower_trajs, left_step, right_step, scale)
+    if enable_steps:
+        _apply_step_motion(lower_trajs, left_step, right_step, scale)
 
     # -- Pack into dict --
     result = {}
@@ -777,7 +850,11 @@ def generate_pca_motion(
     for i, jn in enumerate(joint_names):
         result[jn] = lower_trajs[:, i]
 
-    result["left_foot_step"] = left_step
-    result["right_foot_step"] = right_step
+    # Only expose foot-step phase columns when the optional step layer is
+    # active; otherwise the writer skips them and `simulate.py` keeps both
+    # feet anchored (its default behaviour when the columns are absent).
+    if enable_steps:
+        result["left_foot_step"] = left_step
+        result["right_foot_step"] = right_step
 
     return result

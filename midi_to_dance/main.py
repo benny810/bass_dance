@@ -27,6 +27,23 @@ def main():
                         help="Time step in seconds (default: 0.02 = 50Hz)")
     parser.add_argument("--scale", type=float, default=1.0,
                         help="Motion amplitude scale (default: 1.0)")
+    parser.add_argument("--enable-steps", action="store_true",
+                        help="Layer the optional hand-coded single-leg-lift "
+                             "events on top of PCA motion (OFF by default). "
+                             "This layer is not derived from action primitives "
+                             "and triggers occasional asymmetric leg lifts on "
+                             "accented downbeats.")
+    parser.add_argument("--pc-weights", type=float, nargs="+", default=None,
+                        metavar="W",
+                        help="Per-PC weight multipliers, space-separated "
+                             "(default: 1.0 for all).  Length should match "
+                             "the number of PCs in pca_model.npz (typically "
+                             "7).  Shorter lists are right-padded with 1.0; "
+                             "longer lists are truncated.  PC semantics: "
+                             "1=weight rock, 2=lateral knee shift, 3=squat, "
+                             "4=yaw twist, 5=forward lean, 6=body sway, "
+                             "7=subtle extension.  Example: "
+                             "--pc-weights 1.0 1.0 1.8 0.5 1.0 1.0 1.0")
     parser.add_argument("--plot", action="store_true",
                         help="Visualize the generated trajectory")
     parser.add_argument("--stats", action="store_true",
@@ -43,9 +60,15 @@ def main():
     print(f"  BPM: {midi_data.bpm:.1f}, Time sig: {midi_data.time_signature[0]}/{midi_data.time_signature[1]}")
     print(f"  Notes: {len(midi_data.notes)}, Duration: {midi_data.total_duration_seconds:.1f}s")
 
-    print(f"\nGenerating trajectories (dt={args.dt}s, scale={args.scale})...")
+    pc_w_str = (
+        " ".join(f"{w:.2f}" for w in args.pc_weights)
+        if args.pc_weights else "default (all 1.0)"
+    )
+    print(f"\nGenerating trajectories (dt={args.dt}s, scale={args.scale}, "
+          f"pc_weights={pc_w_str}, enable_steps={args.enable_steps})...")
     sample_times, trajectories = generate_trajectory(
-        str(midi_path), dt=args.dt, scale=args.scale
+        str(midi_path), dt=args.dt, scale=args.scale,
+        pc_weights=args.pc_weights, enable_steps=args.enable_steps,
     )
 
     if args.stats:

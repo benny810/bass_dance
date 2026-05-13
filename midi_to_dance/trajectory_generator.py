@@ -1,6 +1,6 @@
 """Compose motion primitives into full joint trajectories with constraints."""
 
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Sequence, Tuple, Optional
 import numpy as np
 from .midi_parser import parse_midi, MidiData
 from .feature_extractor import extract_features, MusicalFeatures
@@ -112,11 +112,23 @@ def generate_trajectory(
     midi_path: str,
     dt: float = 0.02,
     scale: float = 1.0,
+    pc_weights: Optional[Sequence[float]] = None,
+    enable_steps: bool = False,
 ) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
     """Generate full joint trajectories from a MIDI file.
 
     Lower-body joints (legs + waist) are generated from PCA motion primitives
     extracted from mocap data.  Arm joints stay at their NEUTRAL_STANCE values.
+
+    Parameters
+    ----------
+    scale
+        Global amplitude multiplier (uniform across all PCs).
+    pc_weights
+        Optional per-PC weight multipliers, see `generate_pca_motion`.
+    enable_steps
+        If True, layer the optional hand-coded single-leg-lift events on
+        top of the PCA motion.  OFF by default; see `generate_pca_motion`.
 
     Returns (sample_times, dict of joint_name -> angle_array).
     """
@@ -125,7 +137,10 @@ def generate_trajectory(
     sample_times = features.sample_times
 
     # PCA-based lower-body motion (absolute joint angles, not offsets)
-    pca_output = generate_pca_motion(sample_times, features, scale=scale)
+    pca_output = generate_pca_motion(
+        sample_times, features, scale=scale, pc_weights=pc_weights,
+        enable_steps=enable_steps,
+    )
 
     lower_set = set(LOWER_BODY_JOINTS)
     trajectories: Dict[str, np.ndarray] = {}
