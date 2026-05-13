@@ -151,6 +151,11 @@ def generate_trajectory(
             trajectories[joint_name], sigma=sigma
         )
 
+    # Pass through foot-step phase signals for simulation IK
+    for key in ("left_foot_step", "right_foot_step"):
+        if key in pca_output:
+            trajectories[key] = pca_output[key]
+
     return sample_times, trajectories
 
 

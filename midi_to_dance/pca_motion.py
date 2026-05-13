@@ -33,6 +33,17 @@ LOWER_BODY_JOINTS = [
     "waist_yaw",
 ]
 
+# Joint indices within the 13-element lower-body array
+_L_HIP_P, _L_HIP_R, _L_HIP_Y = 0, 1, 2
+_L_KNEE = 3
+_L_ANK_P, _L_ANK_R = 4, 5
+_R_HIP_P, _R_HIP_R, _R_HIP_Y = 6, 7, 8
+_R_KNEE = 9
+_R_ANK_P, _R_ANK_R = 10, 11
+_WAIST = 12
+
+_ANKLE_INDICES = [_L_ANK_P, _L_ANK_R, _R_ANK_P, _R_ANK_R]
+
 # ---------------------------------------------------------------------------
 # Model loading
 # ---------------------------------------------------------------------------
@@ -332,6 +343,224 @@ def _pc7_phrase_accent(
 
 
 # ---------------------------------------------------------------------------
+# Beat-synced groove patterns  (variety & musicality layer)
+# ---------------------------------------------------------------------------
+
+# Five groove emphasis modes, cycled across musical phrases.
+# Columns: [bounce, double_bounce, twist, sway, pump]
+_MODE_WEIGHTS = np.array([
+    [1.0, 0.2, 0.5, 0.3, 0.4],   # bounce-heavy
+    [0.4, 0.5, 1.0, 0.5, 0.3],   # twist-heavy
+    [0.5, 0.3, 0.3, 1.0, 0.6],   # sway-heavy
+    [0.6, 0.4, 0.6, 0.4, 1.0],   # pump-heavy
+    [0.8, 0.6, 0.7, 0.7, 0.7],   # full groove
+])
+
+
+def _groove_patterns(
+    lower_trajs: np.ndarray,
+    mean_pose: np.ndarray,
+    sample_times: np.ndarray,
+    features: MusicalFeatures,
+    energy: np.ndarray,
+    scale: float,
+) -> None:
+    """Add beat-synced groove patterns to joint trajectories (in-place).
+
+    Targets only hip (pelvic pitch/roll/yaw), knee, and waist joints.
+    Ankle joints are not modified (handled by IK foot-flattening).
+
+    Five patterns are blended via section-based groove mode cycling:
+      1. Beat bounce     — knee flex on each beat
+      2. Double-time     — eighth-note bounce in high-energy sections
+      3. Hip twist       — waist/pelvic yaw on half-note & measure cycles
+      4. Body sway       — pelvic roll alternation on 2-beat cycle
+      5. Forward pump    — pelvic pitch rocking on beat cycle
+    Plus accent-triggered snaps for punctuation.
+    """
+    n = len(sample_times)
+    if n < 2:
+        return
+    dt = float(sample_times[1] - sample_times[0])
+    bpm = features.bpm
+    spb = 60.0 / bpm if bpm > 0 else 0.5
+
+    beat_phase = features.beat_phase
+    beats = sample_times * bpm / 60.0
+    beats_per_measure = max(features.time_signature[0], 1)
+
+    # ---- Section-based groove mode cycling ----
+    boundaries = sorted(features.phrase_boundaries)
+    if not boundaries or boundaries[0] != 0:
+        boundaries = [0] + list(boundaries)
+
+    mode_idx = np.zeros(n, dtype=int)
+    for i in range(len(boundaries)):
+        start = boundaries[i]
+        end = boundaries[i + 1] if i + 1 < len(boundaries) else n
+        mode_idx[start:end] = (i * 3 + 1) % len(_MODE_WEIGHTS)
+
+    weights = _MODE_WEIGHTS[mode_idx]                       # (n, 5)
+    cf_sigma = max(int(spb / dt), 2)
+    for j in range(weights.shape[1]):
+        weights[:, j] = gaussian_filter1d(weights[:, j], sigma=cf_sigma)
+
+    # ---- Pattern 1: Beat bounce (knee flex on downbeats) ----
+    bounce = np.cos(2 * np.pi * beat_phase) * 0.08 * scale * energy * weights[:, 0]
+    lower_trajs[:, _L_KNEE] += bounce
+    lower_trajs[:, _R_KNEE] += bounce
+    lower_trajs[:, _L_HIP_P] -= bounce * 0.35
+    lower_trajs[:, _R_HIP_P] -= bounce * 0.35
+
+    # ---- Pattern 2: Double-time bounce (eighth notes, high energy only) ----
+    high_energy = np.clip((energy - 0.35) * 2.0, 0.0, 1.0)
+    dbl = np.cos(4 * np.pi * beat_phase) * 0.04 * scale * high_energy * weights[:, 1]
+    lower_trajs[:, _L_KNEE] += dbl
+    lower_trajs[:, _R_KNEE] += dbl
+
+    # ---- Pattern 3: Hip twist (waist/pelvic yaw, half-note & measure) ----
+    half_note_phase = (beats % 2.0) / 2.0
+    twist_half = np.sin(2 * np.pi * half_note_phase) * 0.06 * scale
+    measure_phase = (beats % beats_per_measure) / beats_per_measure
+    twist_measure = np.sin(2 * np.pi * measure_phase) * 0.04 * scale
+    twist = (twist_half + twist_measure) * energy * weights[:, 2]
+    lower_trajs[:, _WAIST] += twist
+    lower_trajs[:, _L_HIP_Y] += twist * 0.35
+    lower_trajs[:, _R_HIP_Y] += twist * 0.35
+
+    # ---- Pattern 4: Side-to-side sway (pelvic roll, 2-beat cycle) ----
+    sway = np.sin(2 * np.pi * half_note_phase) * 0.04 * scale * energy * weights[:, 3]
+    lower_trajs[:, _L_HIP_R] += sway
+    lower_trajs[:, _R_HIP_R] -= sway
+
+    # ---- Pattern 5: Forward-back pump (pelvic pitch, beat-synced) ----
+    pump_phase = 2 * np.pi * beat_phase + np.pi / 6
+    pump = np.sin(pump_phase) * 0.05 * scale * energy * weights[:, 4]
+    lower_trajs[:, _L_HIP_P] += pump
+    lower_trajs[:, _R_HIP_P] += pump
+
+    # ---- Accent snap (quick hip/waist pop on strong accents) ----
+    snap = np.zeros(n)
+    decay_s = int(0.12 / dt)
+    for idx in features.onset_indices:
+        if idx >= n:
+            continue
+        if features.accent[idx] > 0.3:
+            amp = features.onset_strength[idx] * 0.05 * scale
+            end_idx = min(idx + decay_s, n)
+            t_decay = np.arange(end_idx - idx) * dt
+            snap[idx:end_idx] += amp * np.exp(-t_decay / 0.08)
+    snap *= energy
+    snap_dir = np.sign(np.sin(np.pi * beats))
+    lower_trajs[:, _WAIST] += snap * snap_dir * 0.8
+    lower_trajs[:, _L_HIP_Y] += snap * snap_dir * 0.3
+    lower_trajs[:, _R_HIP_Y] += snap * snap_dir * 0.3
+
+
+# ---------------------------------------------------------------------------
+# Explicit stepping accents  (visible foot-lift on accented beats)
+# ---------------------------------------------------------------------------
+
+def _identify_step_events(
+    sample_times: np.ndarray,
+    features: MusicalFeatures,
+    energy: np.ndarray,
+) -> tuple:
+    """Identify step trigger frames and compute foot-lift phase signals.
+
+    Triggers on accented low-note downbeats (>=8 beats apart).  Each step
+    is a 1.5-beat bell curve; left and right alternate.
+
+    Returns (left_step, right_step) arrays in [0, 1], where 0 = planted and
+    1 = peak of step.  This function does not modify any trajectory; callers
+    use the returned signals both to drive step motion and to suppress
+    rhythm contributions during the step interval.
+    """
+    n = len(sample_times)
+    left_step = np.zeros(n)
+    right_step = np.zeros(n)
+    if n < 2:
+        return left_step, right_step
+
+    dt = float(sample_times[1] - sample_times[0])
+    bpm = features.bpm
+    spb = 60.0 / bpm if bpm > 0 else 0.5
+    bps = bpm / 60.0
+
+    triggers = []
+    last_beat = -20.0
+    for i in range(n):
+        if (features.is_downbeat[i] > 0.5
+                and features.accent[i] > 0.15
+                and features.is_low_note[i] > 0.5
+                and energy[i] > 0.25):
+            beat = sample_times[i] * bps
+            if beat - last_beat >= 8.0:
+                triggers.append(i)
+                last_beat = beat
+
+    step_dur = 1.5 * spb
+    step_samples = max(int(step_dur / dt), 1)
+    is_left = True
+
+    for ti in triggers:
+        step_arr = left_step if is_left else right_step
+        for j in range(min(step_samples, n - ti)):
+            bell = np.sin(np.pi * j / step_samples) ** 2
+            step_arr[ti + j] = max(step_arr[ti + j], bell)
+        is_left = not is_left
+
+    sm = max(int(0.03 / dt), 1)
+    if np.any(left_step > 0):
+        left_step = gaussian_filter1d(left_step, sigma=sm)
+    if np.any(right_step > 0):
+        right_step = gaussian_filter1d(right_step, sigma=sm)
+
+    return np.clip(left_step, 0.0, 1.0), np.clip(right_step, 0.0, 1.0)
+
+
+def _rhythm_suppression_mask(
+    step_active: np.ndarray,
+    dt: float,
+) -> np.ndarray:
+    """Build a [0, 1] mask that is 0 during stepping (rhythm suppressed) and
+    1 elsewhere (full rhythm).  The mask widens the raw step phase so rhythm
+    is silenced for a brief lead-in / tail-out around each step, then ramps
+    smoothly back to full activity."""
+    if not np.any(step_active > 0):
+        return np.ones_like(step_active)
+
+    widen_sigma = max(int(0.25 / dt), 1)
+    expanded = gaussian_filter1d(step_active, sigma=widen_sigma)
+    expanded = np.clip(expanded * 3.0, 0.0, 1.0)
+    ramp_sigma = max(int(0.12 / dt), 1)
+    expanded = gaussian_filter1d(expanded, sigma=ramp_sigma)
+    return 1.0 - np.clip(expanded, 0.0, 1.0)
+
+
+def _apply_step_motion(
+    lower_trajs: np.ndarray,
+    left_step: np.ndarray,
+    right_step: np.ndarray,
+    scale: float,
+) -> None:
+    """Add asymmetric knee bend + hip flex on the lifting leg (in-place).
+
+    Applied AFTER rhythm/groove have been masked off, so the step is the
+    only motion happening during a step phase.  Amplitudes are larger than
+    before so the lift is clearly visible.
+    """
+    extra_knee = 0.55 * scale
+    hip_flex = 0.20 * scale
+
+    lower_trajs[:, _L_KNEE] += extra_knee * left_step
+    lower_trajs[:, _L_HIP_P] -= hip_flex * left_step
+
+    lower_trajs[:, _R_KNEE] += extra_knee * right_step
+    lower_trajs[:, _R_HIP_P] -= hip_flex * right_step
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -367,6 +596,12 @@ def generate_pca_motion(
         features.accent, features.bpm,
     )
 
+    # -- Step events: identified up front so rhythm can be suppressed --
+    left_step, right_step = _identify_step_events(sample_times, features, energy)
+    step_active = np.maximum(left_step, right_step)
+    rhythm_mask = _rhythm_suppression_mask(step_active, dt)
+    masked_energy = energy * rhythm_mask
+
     # -- Build activation matrix --
     # activation = carrier * modulated_energy * amplitude + accent
     # Energy is squared to increase section-to-section contrast (quiet
@@ -384,7 +619,7 @@ def generate_pca_motion(
         activations[:, 0] += _pc1_onset_accent(
             n, dt, features.onset_indices, features.onset_strength,
             features.beat_phase, features.accent,
-            depth=amps[0] * 1.2,
+            depth=amps[0] * 1.0,
         )
 
     if n_comp >= 2:
@@ -428,8 +663,28 @@ def generate_pca_motion(
             amplitude=amps[6],
         )
 
+    # -- Suppress all rhythm activations during step intervals --
+    activations *= rhythm_mask[:, np.newaxis]
+
     # -- Reconstruct: (n, 13) = mean + activations @ components --
     lower_trajs = mean_pose[np.newaxis, :] + activations @ components
+
+    # -- Feet planted: zero ankle motion, let IK handle foot-flattening --
+    for idx in _ANKLE_INDICES:
+        lower_trajs[:, idx] = mean_pose[idx]
+
+    # -- Beat-synced groove patterns (energy gated by rhythm_mask) --
+    _groove_patterns(
+        lower_trajs, mean_pose, sample_times, features, masked_energy, scale,
+    )
+
+    # -- Hip pitch constraint: prevent bass-thigh collision --
+    _HIP_PITCH_MIN = -0.35
+    lower_trajs[:, _L_HIP_P] = np.maximum(lower_trajs[:, _L_HIP_P], _HIP_PITCH_MIN)
+    lower_trajs[:, _R_HIP_P] = np.maximum(lower_trajs[:, _R_HIP_P], _HIP_PITCH_MIN)
+
+    # -- Apply step motion last so it's the only motion during a step --
+    _apply_step_motion(lower_trajs, left_step, right_step, scale)
 
     # -- Pack into dict --
     result = {}
@@ -446,5 +701,8 @@ def generate_pca_motion(
 
     for i, jn in enumerate(joint_names):
         result[jn] = lower_trajs[:, i]
+
+    result["left_foot_step"] = left_step
+    result["right_foot_step"] = right_step
 
     return result

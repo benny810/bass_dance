@@ -51,6 +51,24 @@ def _apply_base_rotation(qpos, delta_pitch, delta_roll):
     qpos[3:7] = q_new
 
 
+def _apply_base_yaw(qpos, delta_yaw):
+    """Apply yaw (Z-axis) rotation to the base_link quaternion at qpos[3:7]."""
+    cy = np.cos(delta_yaw / 2.0)
+    sy = np.sin(delta_yaw / 2.0)
+    q_yaw = np.array([cy, 0.0, 0.0, sy])
+    q_current = qpos[3:7].copy()
+    q_new = _quat_multiply(q_yaw, q_current)
+    q_new /= np.linalg.norm(q_new)
+    qpos[3:7] = q_new
+
+
+def _foot_min_z(data, ankle_id, foot_verts):
+    """Minimum world Z coordinate of all foot mesh vertices."""
+    xpos = data.xpos[ankle_id]
+    z_row = data.xmat[ankle_id][6:9]
+    return float((xpos[2] + foot_verts @ z_row).min())
+
+
 # ---------------------------------------------------------------------------
 # ZMP / CoM balance helpers
 # ---------------------------------------------------------------------------
@@ -459,6 +477,25 @@ def main():
             ap_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, ap_body)
             ankle_pitch_parent[side] = model.body_parentid[ap_body_id]
 
+        # Hip joint qpos/dof indices for Jacobian-based per-leg foot anchor.
+        # Adjusting hip pitch/roll/yaw lets us drive each foot back to its
+        # reference XY without altering knee bend or waist/torso motion.
+        leg_dof_cols: dict = {}
+        leg_qpos_cols: dict = {}
+        for side in ["left", "right"]:
+            dofs = []
+            qposes = []
+            for jname in (
+                f"{side}_leg_pelvic_pitch_joint",
+                f"{side}_leg_pelvic_roll_joint",
+                f"{side}_leg_pelvic_yaw_joint",
+            ):
+                jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, jname)
+                dofs.append(int(model.jnt_dofadr[jid]))
+                qposes.append(int(model.jnt_qposadr[jid]))
+            leg_dof_cols[side] = dofs
+            leg_qpos_cols[side] = qposes
+
         # Load foot mesh vertices (local frame relative to ankle_roll_link body)
         mesh_dir = Path(__file__).parent.parent / "casbot_band_urdf" / "meshes"
         foot_verts = {}  # side -> (N, 3) float32 array
@@ -477,18 +514,33 @@ def main():
                     f.read(2)  # attribute
             foot_verts[side] = np.unique(np.array(verts, dtype=np.float32), axis=0)
 
+        # Step phase data (0 = planted, >0 = foot in the air)
+        left_foot_step = joint_data.get("left_foot_step", np.zeros(n_frames))
+        right_foot_step = joint_data.get("right_foot_step", np.zeros(n_frames))
+        n_steps = int(np.sum(left_foot_step > 0.1) + np.sum(right_foot_step > 0.1))
+
         print(f"  Computing foot-ground constraints + ZMP balance "
-              f"(left: {len(foot_verts['left'])} verts, right: {len(foot_verts['right'])} verts)...")
+              f"(left: {len(foot_verts['left'])} verts, "
+              f"right: {len(foot_verts['right'])} verts, "
+              f"step frames: {n_steps})...")
+
+        ref_foot_L = None  # reference XY for left foot (set on first frame)
+        ref_foot_R = None  # reference XY for right foot
 
         for frame in range(n_frames):
             data.qpos[:] = qpos_sequence[frame]
+
+            l_stepping = left_foot_step[frame] > 0.1
+            r_stepping = right_foot_step[frame] > 0.1
 
             # Iterative IK: foot-flattening, Z-contact, and CoM balance
             for _iter in range(20):
                 mujoco.mj_kinematics(model, data)
 
-                # -- 1. Foot flattening: ankle pitch/roll so foot +Z points up --
+                # -- 1. Foot flattening (planted feet only) --
                 for side in ["left", "right"]:
+                    if (side == "left" and l_stepping) or (side == "right" and r_stepping):
+                        continue
                     z_k = data.xmat[ankle_pitch_parent[side]][6:9]
                     new_roll = np.arcsin(np.clip(-z_k[1], -1.0, 1.0))
                     new_pitch = np.arctan2(z_k[0], z_k[2])
@@ -499,9 +551,18 @@ def main():
 
                 mujoco.mj_kinematics(model, data)
 
-                # -- 2. Foot-ground contact: base Z so lowest foot vertex touches floor --
+                # -- 2. Foot-ground contact (support foot/feet only) --
                 foot_min_z = float("inf")
-                for side, body_id in [("left", left_ankle_id), ("right", right_ankle_id)]:
+                support_sides = []
+                if not l_stepping:
+                    support_sides.append(("left", left_ankle_id))
+                if not r_stepping:
+                    support_sides.append(("right", right_ankle_id))
+                if not support_sides:
+                    support_sides = [("left", left_ankle_id),
+                                     ("right", right_ankle_id)]
+
+                for side, body_id in support_sides:
                     xpos = data.xpos[body_id]
                     z_row = data.xmat[body_id][6:9]
                     world_z = xpos[2] + foot_verts[side] @ z_row
@@ -510,29 +571,112 @@ def main():
 
                 mujoco.mj_kinematics(model, data)
 
-                # -- 3. ZMP / CoM balance: pitch only of the floating base --
-                # Roll is intentionally NOT adjusted here — rotating the base
-                # around X would slide the feet laterally.  Lateral balance is
-                # handled by ankle-roll compensation in the sway primitive.
+                # -- 3. ZMP / CoM balance --
                 com = _compute_robot_com(model, data)
-                support_center = _compute_support_center(
-                    data, left_ankle_id, right_ankle_id,
-                )
-                com_error_x = support_center[0] - com[0]  # desired - actual
+                if l_stepping and not r_stepping:
+                    sup_xy = data.xpos[right_ankle_id][:2]
+                elif r_stepping and not l_stepping:
+                    sup_xy = data.xpos[left_ankle_id][:2]
+                else:
+                    sup_xy = _compute_support_center(
+                        data, left_ankle_id, right_ankle_id,
+                    )
+                com_error_x = sup_xy[0] - com[0]
 
                 if abs(com_error_x) < 0.003:
                     break
 
                 com_height = max(com[2] - FLOOR_Z, 0.1)
                 gain = 0.35
-                delta_pitch = np.clip(com_error_x / com_height * gain, -0.06, 0.06)
+                delta_pitch = np.clip(
+                    com_error_x / com_height * gain, -0.06, 0.06,
+                )
                 _apply_base_rotation(data.qpos, delta_pitch, 0.0)
 
-            # -- 4. XY anchor: cancel any foot drift so feet stay planted --
+            # -- 4. Foot anchoring (iterative refinement) --
+            # Base XY/yaw alone cannot cancel antisymmetric leg motion (PC2/PC5
+            # load left/right hip yaw differently → feet splay).  Each refine
+            # iteration: align base yaw + centroid, then drive any per-foot
+            # residual to zero with a damped Jacobian correction on that leg's
+            # hip pitch/roll/yaw.
             mujoco.mj_kinematics(model, data)
-            sc = _compute_support_center(data, left_ankle_id, right_ankle_id)
-            data.qpos[0] -= sc[0]
-            data.qpos[1] -= sc[1]
+            foot_L_xy = data.xpos[left_ankle_id][:2].copy()
+            foot_R_xy = data.xpos[right_ankle_id][:2].copy()
+
+            if ref_foot_L is None:
+                ref_foot_L = foot_L_xy
+                ref_foot_R = foot_R_xy
+            else:
+                for _refine in range(12):
+                    mujoco.mj_kinematics(model, data)
+                    foot_L_xy = data.xpos[left_ankle_id][:2].copy()
+                    foot_R_xy = data.xpos[right_ankle_id][:2].copy()
+
+                    if l_stepping:
+                        ref_foot_L = foot_L_xy
+                    if r_stepping:
+                        ref_foot_R = foot_R_xy
+
+                    # Stage A: base yaw + centroid for non-stepping case
+                    if not l_stepping and not r_stepping:
+                        cur_vec = foot_R_xy - foot_L_xy
+                        ref_vec = ref_foot_R - ref_foot_L
+                        dyaw = (np.arctan2(ref_vec[1], ref_vec[0])
+                                - np.arctan2(cur_vec[1], cur_vec[0]))
+                        if abs(dyaw) > 1e-6:
+                            _apply_base_yaw(data.qpos, dyaw)
+                            mujoco.mj_kinematics(model, data)
+                            foot_L_xy = data.xpos[left_ankle_id][:2].copy()
+                            foot_R_xy = data.xpos[right_ankle_id][:2].copy()
+
+                        cur_c = (foot_L_xy + foot_R_xy) / 2.0
+                        ref_c = (ref_foot_L + ref_foot_R) / 2.0
+                        data.qpos[0] += ref_c[0] - cur_c[0]
+                        data.qpos[1] += ref_c[1] - cur_c[1]
+                    elif l_stepping and not r_stepping:
+                        data.qpos[0] += ref_foot_R[0] - foot_R_xy[0]
+                        data.qpos[1] += ref_foot_R[1] - foot_R_xy[1]
+                    elif r_stepping and not l_stepping:
+                        data.qpos[0] += ref_foot_L[0] - foot_L_xy[0]
+                        data.qpos[1] += ref_foot_L[1] - foot_L_xy[1]
+                    else:
+                        break  # both stepping (shouldn't happen)
+
+                    mujoco.mj_kinematics(model, data)
+                    foot_L_xy = data.xpos[left_ankle_id][:2].copy()
+                    foot_R_xy = data.xpos[right_ankle_id][:2].copy()
+                    drift_L = ref_foot_L - foot_L_xy
+                    drift_R = ref_foot_R - foot_R_xy
+
+                    max_drift = 0.0
+                    if not l_stepping:
+                        max_drift = max(max_drift, float(np.abs(drift_L).max()))
+                    if not r_stepping:
+                        max_drift = max(max_drift, float(np.abs(drift_R).max()))
+                    if max_drift < 1e-4:
+                        break
+
+                    # Stage B: per-leg Jacobian correction (planted feet only).
+                    # mj_jacBody requires mj_comPos in addition to mj_kinematics,
+                    # otherwise the returned Jacobian is identically zero.
+                    mujoco.mj_comPos(model, data)
+                    for side, body_id, drift, stepping in (
+                        ("left", left_ankle_id, drift_L, l_stepping),
+                        ("right", right_ankle_id, drift_R, r_stepping),
+                    ):
+                        if stepping or float(np.abs(drift).max()) < 1e-4:
+                            continue
+                        jacp = np.zeros((3, model.nv))
+                        mujoco.mj_jacBody(model, data, jacp, None, body_id)
+                        J = jacp[:2, leg_dof_cols[side]]
+                        JJT = J @ J.T + 1e-4 * np.eye(2)
+                        try:
+                            dq = J.T @ np.linalg.solve(JJT, drift)
+                        except np.linalg.LinAlgError:
+                            continue
+                        dq = np.clip(dq, -0.05, 0.05)
+                        for k, qp_idx in enumerate(leg_qpos_cols[side]):
+                            data.qpos[qp_idx] += float(dq[k])
 
             # Save balanced pose back to the sequence
             qpos_sequence[frame] = data.qpos.copy()

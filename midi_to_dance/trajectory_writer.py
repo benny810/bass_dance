@@ -4,6 +4,8 @@ from typing import Dict
 import numpy as np
 from .trajectory_generator import JOINT_NAMES
 
+_EXTRA_COLUMNS = ["left_foot_step", "right_foot_step"]
+
 
 def write_csv(
     filepath: str,
@@ -12,10 +14,15 @@ def write_csv(
 ):
     """Write trajectories to a CSV file with header.
 
-    Format: timestamp, joint_1, joint_2, ..., joint_N
+    Format: timestamp, joint_1, ..., joint_N [, left_foot_step, right_foot_step]
     """
-    header = ["timestamp"] + JOINT_NAMES
-    data = np.column_stack([sample_times] + [trajectories[n] for n in JOINT_NAMES])
+    columns = list(JOINT_NAMES)
+    for col in _EXTRA_COLUMNS:
+        if col in trajectories:
+            columns.append(col)
+
+    header = ["timestamp"] + columns
+    data = np.column_stack([sample_times] + [trajectories[n] for n in columns])
 
     np.savetxt(filepath, data, delimiter=",", header=",".join(header),
                fmt="%.6f", comments="")
