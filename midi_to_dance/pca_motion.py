@@ -78,13 +78,13 @@ def _load_pca_model(pca_model_path: Optional[str] = None) -> dict:
 # so the combined signal never exactly repeats within a typical song length.
 # Frequencies are in the 0.02-0.35 Hz range, matching mocap dominant spectra.
 _CARRIER_PERIODS = [
-    [8.3, 17.7, 35.1],    # PC1 – stance depth
-    [5.7, 13.3, 29.5],    # PC2 – pelvic yaw
-    [3.1, 7.9, 19.3],     # PC3 – ankle rock (faster, beat-like)
-    [11.2, 23.4, 41.7],   # PC4 – stride accent
-    [6.5, 15.1, 31.8],    # PC5 – asymmetric hip twist
-    [9.7, 21.1, 37.3],    # PC6 – weight shift
-    [14.3, 27.6, 43.9],   # PC7 – breathing pelvic tilt
+    [8.3, 17.7, 35.1],    # PC1 – weighted sway (symmetric ankle + hip pitch)
+    [5.7, 13.3, 29.5],    # PC2 – lateral step (anti-symmetric knee)
+    [3.1, 7.9, 19.3],     # PC3 – symmetric squat (symmetric knee bend)
+    [11.2, 23.4, 41.7],   # PC4 – pelvic yaw (symmetric pelvic yaw)
+    [6.5, 15.1, 31.8],    # PC5 – forward lean (symmetric hip pitch)
+    [9.7, 21.1, 37.3],    # PC6 – lateral lean (symmetric hip roll)
+    [14.3, 27.6, 43.9],   # PC7 – full stretch (symmetric ankle + knee extension)
 ]
 
 
@@ -151,7 +151,7 @@ def _pc1_onset_accent(
     depth: float,
     decay_time: float = 0.15,
 ) -> np.ndarray:
-    """PC1 accent: onset-triggered stance-flex impulse (negative direction)."""
+    """PC1 (weighted sway) onset accent: note onsets trigger knee-flex impulse."""
     activation = np.zeros(n)
     decay_samples = int(decay_time / dt)
 
@@ -181,7 +181,7 @@ def _pc4_accent_envelope(
     amplitude: float,
     hold_beats: float = 3.0,
 ) -> np.ndarray:
-    """PC4 accent: accented low-note downbeats trigger ADSR stride."""
+    """PC4 (pelvic yaw) accent: accented low-note downbeats trigger ADSR pelvic yaw."""
     bps = bpm / 60.0
     spb = 60.0 / bpm if bpm > 0 else 0.5
 
@@ -225,7 +225,7 @@ def _pc2_pitch_accent(
     phrase_boundaries: Set[int],
     amplitude: float,
 ) -> np.ndarray:
-    """PC2 accent: pitch-level modulation + measure wave + phrase pulses."""
+    """PC2 (lateral step) accent: pitch-level modulation + measure wave + phrase pulses."""
     pitch_dev = pitch_level - np.mean(pitch_level)
 
     beats_per_measure = time_signature[0]
@@ -252,7 +252,7 @@ def _pc3_beat_accent(
     onset_strength: np.ndarray,
     amplitude: float,
 ) -> np.ndarray:
-    """PC3 accent: beat-synced heel-toe rocking, modulated by onset envelope."""
+    """PC3 (symmetric squat) accent: beat-synced knee bend, modulated by onset envelope."""
     activation = np.sin(2 * np.pi * beat_phase) * amplitude * 0.5
 
     onset_env = np.zeros(n)
@@ -275,7 +275,7 @@ def _pc5_density_accent(
     bpm: float,
     amplitude: float,
 ) -> np.ndarray:
-    """PC5 accent: rhythmic density drives asymmetric hip twist."""
+    """PC5 (forward lean) accent: rhythmic note density drives forward-back hip pitch."""
     impulse = np.zeros(n)
     for idx in onset_indices:
         if idx < n:
@@ -300,7 +300,7 @@ def _pc6_register_accent(
     pitch_level: np.ndarray,
     amplitude: float,
 ) -> np.ndarray:
-    """PC6 accent: pitch register  ->  right-leg weight-shift."""
+    """PC6 (lateral lean) accent: pitch register drives body sway via hip roll."""
     centered = pitch_level - np.mean(pitch_level)
     std = np.std(pitch_level)
     if std > 1e-10:
@@ -317,7 +317,7 @@ def _pc7_phrase_accent(
     phrase_boundaries: Set[int],
     amplitude: float,
 ) -> np.ndarray:
-    """PC7 accent: phrase-level breathing arc."""
+    """PC7 (full stretch) accent: phrase-level breathing arc drives ankle + knee extension."""
     boundaries = sorted(phrase_boundaries)
     if len(boundaries) == 0 or boundaries[0] != 0:
         boundaries = [0] + boundaries
