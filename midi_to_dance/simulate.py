@@ -268,6 +268,25 @@ def _smooth_kinematic_display_sequence(
             qpos_sequence[:, idx], sigma=sig * 1.2, mode="nearest",
         )
 
+    # Stage-B Jacobian refinement modifies hip pelvic_pitch/roll/yaw per
+    # frame to anchor each foot's XY; the residual is small but oscillates
+    # frame-to-frame, showing up as visible thigh wobble.  Mild smoothing
+    # of those columns (≈ 0.6× the base sigma, so ≈ 30 ms) tames it
+    # without delaying perceived motion.  Foot Z drift from this small
+    # hip change is removed by the post-smoothing settle pass that runs
+    # right after this function.
+    hip_sig = sig * 0.6
+    for jn in ("left_leg_pelvic_pitch", "left_leg_pelvic_roll",
+               "left_leg_pelvic_yaw",
+               "right_leg_pelvic_pitch", "right_leg_pelvic_roll",
+               "right_leg_pelvic_yaw",
+               "left_leg_knee_pitch", "right_leg_knee_pitch"):
+        ji = qpos_map.get(jn)
+        if ji is not None:
+            qpos_sequence[:, ji] = gaussian_filter1d(
+                qpos_sequence[:, ji], sigma=hip_sig, mode="nearest",
+            )
+
 
 def load_trajectory(csv_path: str, fps: float = 50.0):
     """Load CSV trajectory into (timestamps, joint_data dict, joint_names).

@@ -158,13 +158,26 @@ def generate_trajectory(
         low, high = JOINT_LIMITS[joint_name]
         trajectories[joint_name] = np.clip(trajectories[joint_name], low, high)
 
-    # Light smoothing
+    # Two-stage smoothing.
+    #
+    # Stage 1 (σ ≈ 3 frames ≈ 60 ms): kill remaining HF content per joint.
+    # Beats at 60–120 BPM span 500–1000 ms, so 60 ms group delay is < 1/8
+    # beat — imperceptible as latency while obviously smoother visually.
+    #
+    # Stage 2 (Savitzky–Golay order-3 over 9 frames): preserves the peak
+    # shape of the surviving event impulses (squat-flex, stride hold,
+    # accent snap) better than a second Gaussian pass would — important
+    # for keeping perceived rhythm crispness.  Equivalent to a low-pass
+    # that drops content above ~10 Hz but lets ~5 Hz musical accents
+    # through cleanly.
     from scipy.ndimage import gaussian_filter1d
-    sigma = 2  # ~40ms at 50Hz
+    from scipy.signal import savgol_filter
+    sigma = 3
     for joint_name in JOINT_NAMES:
-        trajectories[joint_name] = gaussian_filter1d(
-            trajectories[joint_name], sigma=sigma
-        )
+        y = gaussian_filter1d(trajectories[joint_name], sigma=sigma)
+        if len(y) >= 9:
+            y = savgol_filter(y, window_length=9, polyorder=3, mode="nearest")
+        trajectories[joint_name] = y
 
     # Pass through foot-step phase signals for simulation IK
     for key in ("left_foot_step", "right_foot_step"):

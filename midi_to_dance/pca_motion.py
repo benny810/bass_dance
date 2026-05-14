@@ -874,6 +874,19 @@ def generate_pca_motion(
     if enable_steps:
         activations *= rhythm_mask[:, np.newaxis]
 
+    # -- Soften event-driven corners on each PC activation --
+    # Carriers are sinusoidal (already smooth), but `_squat_flex_accent`
+    # (exp-decay impulse), `_stride_accent` (40 ms ramp), and the beat-
+    # rock gate jump on/off with the onset envelope.  A σ ≈ 1 frame
+    # (≈ 20 ms) gaussian removes those sub-perceptual corners without
+    # phase-shifting the peak (we worked to keep event peaks within
+    # 40 ms of triggers; this stays well inside that budget).
+    act_sigma = max(0.020 / dt, 0.7)
+    for i in range(n_comp):
+        activations[:, i] = gaussian_filter1d(
+            activations[:, i], sigma=act_sigma, mode="nearest",
+        )
+
     # -- Reconstruct: (n, 13) = mean + activations @ components --
     lower_trajs = mean_pose[np.newaxis, :] + activations @ components
 
