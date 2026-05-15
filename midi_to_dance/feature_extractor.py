@@ -130,6 +130,105 @@ def _build_metric_accent_array(
 
 
 # ---------------------------------------------------------------------------
+# BPM-only feature synthesis (no MIDI)
+# ---------------------------------------------------------------------------
+
+def synthesize_features_from_bpm(
+    bpm: float,
+    duration: float,
+    dt: float = 0.02,
+    time_signature: Tuple[int, int] = (4, 4),
+) -> MusicalFeatures:
+    """Synthesize a `MusicalFeatures` driven only by a metronomic beat grid.
+
+    No MIDI file is required — onsets are placed at every beat and downbeat
+    with synthetic velocities, and all derivative features (energy, accent,
+    phrase boundaries) are built from this uniform grid.  The result feeds
+    the same `pca_motion.generate_pca_motion()` pipeline unchanged.
+    """
+    bpm = float(max(bpm, 1.0))
+    beats_per_measure = max(time_signature[0], 1)
+    bps = bpm / 60.0
+    spb = 60.0 / bpm
+
+    n_samples = int(np.ceil(duration / dt)) + 1
+    sample_times = np.arange(n_samples) * dt
+
+    # -- Beat / downbeat grid --
+    beats = sample_times * bps
+    nearest_beat = np.round(beats)
+    dist_to_beat = np.abs(beats - nearest_beat)
+    beat_window = dt * bps * 0.5 + 1e-9
+    is_beat = (dist_to_beat < beat_window).astype(np.float64)
+    is_downbeat = is_beat * (
+        nearest_beat.astype(np.int64) % beats_per_measure == 0
+    )
+    beat_phase = beats % 1.0
+
+    # -- Synthetic onsets at each beat (velocity=100), boosted at downbeats (110) --
+    onset_strength = np.zeros(n_samples)
+    onset_strength[is_beat > 0.5] = 100.0 / 127.0
+    onset_strength[is_downbeat > 0.5] = 110.0 / 127.0
+
+    onset_indices = np.where(is_beat > 0.5)[0].astype(np.int64)
+
+    # -- Metric accent --
+    metric_accent = _build_metric_accent_array(sample_times, bpm, beats_per_measure)
+
+    # -- Accent: metric_accent only (no velocity/deviation/duration/leap data) --
+    accent = metric_accent.copy()
+
+    # -- Note density & energy (smoothed onset track, ~1.5 beats wide) --
+    onset_count = np.zeros(n_samples)
+    onset_count[is_beat > 0.5] = 1.0
+    density_sigma = max(int(1.5 * spb / dt), 3)
+    note_density = gaussian_filter1d(onset_count, sigma=density_sigma)
+    nd_max = float(note_density.max())
+    if nd_max > 1e-9:
+        note_density /= nd_max
+
+    energy = note_density.copy()
+
+    # -- Pitch level: constant mid-register (no melodic variation) --
+    pitch_level = np.full(n_samples, 0.5)
+
+    # -- Pitch contour & low-note: flat --
+    pitch_contour = np.zeros(n_samples)
+    is_low_note = np.zeros(n_samples)
+
+    # -- Phrase boundaries: every 8 measures --
+    sec_per_measure = beats_per_measure * spb
+    section_seconds = sec_per_measure * 8
+    phrase_boundaries: Set[int] = {0}
+    if section_seconds > 0:
+        t = section_seconds
+        while t < duration:
+            idx = int(round(t / dt))
+            if 0 <= idx < n_samples:
+                phrase_boundaries.add(idx)
+            t += section_seconds
+
+    return MusicalFeatures(
+        sample_times=sample_times,
+        bpm=bpm,
+        time_signature=time_signature,
+        onset_strength=onset_strength,
+        note_density=note_density,
+        energy=energy,
+        beat_phase=beat_phase,
+        is_beat=is_beat,
+        is_downbeat=is_downbeat,
+        metric_accent=metric_accent,
+        pitch_level=pitch_level,
+        pitch_contour=pitch_contour,
+        accent=accent,
+        is_low_note=is_low_note,
+        onset_indices=onset_indices,
+        phrase_boundaries=phrase_boundaries,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main feature extraction
 # ---------------------------------------------------------------------------
 

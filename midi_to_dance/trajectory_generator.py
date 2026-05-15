@@ -187,6 +187,54 @@ def generate_trajectory(
     return sample_times, trajectories
 
 
+def generate_trajectory_from_features(
+    sample_times: np.ndarray,
+    features: MusicalFeatures,
+    scale: float = 1.0,
+    pc_weights: Optional[Sequence[float]] = None,
+    enable_steps: bool = False,
+) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+    """Generate full joint trajectories from pre-computed `MusicalFeatures`.
+
+    This is the same as `generate_trajectory()` but skips the internal MIDI
+    parse + feature extraction — the caller provides `sample_times` and
+    `features` directly (e.g. from `synthesize_features_from_bpm`).
+    """
+    pca_output = generate_pca_motion(
+        sample_times, features, scale=scale, pc_weights=pc_weights,
+        enable_steps=enable_steps,
+    )
+
+    lower_set = set(LOWER_BODY_JOINTS)
+    trajectories: Dict[str, np.ndarray] = {}
+    for joint_name in JOINT_NAMES:
+        if joint_name in lower_set:
+            trajectories[joint_name] = pca_output[joint_name]
+        else:
+            trajectories[joint_name] = np.full(
+                len(sample_times), NEUTRAL_STANCE.get(joint_name, 0.0)
+            )
+
+    for joint_name in JOINT_NAMES:
+        low, high = JOINT_LIMITS[joint_name]
+        trajectories[joint_name] = np.clip(trajectories[joint_name], low, high)
+
+    from scipy.ndimage import gaussian_filter1d
+    from scipy.signal import savgol_filter
+    sigma = 3
+    for joint_name in JOINT_NAMES:
+        y = gaussian_filter1d(trajectories[joint_name], sigma=sigma)
+        if len(y) >= 9:
+            y = savgol_filter(y, window_length=9, polyorder=3, mode="nearest")
+        trajectories[joint_name] = y
+
+    for key in ("left_foot_step", "right_foot_step"):
+        if key in pca_output:
+            trajectories[key] = pca_output[key]
+
+    return sample_times, trajectories
+
+
 def trajectory_stats(
     sample_times: np.ndarray,
     trajectories: Dict[str, np.ndarray],

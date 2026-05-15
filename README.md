@@ -203,11 +203,43 @@ python -m midi_to_dance.main mid/yellow_bass.mid \
 
 `--enable-steps` 开启时会在 PCA 之上额外叠加一层重拍抬腿事件（钟形铃 + 节奏抑制掩码），并在 CSV 中追加 `left_foot_step` / `right_foot_step` 两列；默认关闭以保证机器人双脚全程锚定。
 
+### 步骤 2b（可选）：仅给定 BPM 生成舞蹈轨迹（无 MIDI）
+
+无需提供 MIDI 文件，只指定 BPM、时长、拍号即可生成基于节拍器的舞蹈动作。系统会自动合成一套节拍网格（每拍一个 onset，强拍略强），驱动 `pca_motion.py` 的完整三层架构（载波 + 能量包络 + 事件重音），产生与 BPM 匹配的节奏性舞蹈。
+
+```bash
+# 基本用法：120 BPM，30 秒，4/4 拍
+python -m midi_to_dance.main --bpm 120 --duration 30 -o csv/bpm_output.csv
+
+# 慢速叙事曲，启用抬腿
+python -m midi_to_dance.main --bpm 65 --duration 60 --enable-steps -o csv/slow.csv
+
+# 3/4 华尔兹
+python -m midi_to_dance.main --bpm 90 --duration 45 --time-signature 3/4 -o csv/waltz.csv
+
+# 完整选项
+python -m midi_to_dance.main --bpm 100 --duration 30 \
+    -o csv/bpm_output.csv \
+    --time-signature 4/4 \                    # 拍号，默认 4/4
+    --scale 1.2 \                            # 全局幅度缩放
+    --pc-weights 1.0 1.0 1.8 0.4 1.0 1.0 1.0 \
+    --enable-steps \                         # 可选：启用跨步抬腿
+    --stats \                                # 打印关节统计
+    --plot                                   # 生成 matplotlib 可视化
+```
+
+> **原理：** `feature_extractor.synthesize_features_from_bpm()` 以 BPM 为基准构造节拍网格，合成 `MusicalFeatures`（每个节拍为虚拟 onset velocity=100、强拍 velocity=110；`energy` 由节拍密度平滑得到；`accent` 使用节拍层级权重；`phrase_boundaries` 每 8 小节一个），然后通过 `trajectory_generator.generate_trajectory_from_features()` 跳过 MIDI 解析直接送入 `pca_motion.py`。其余流水线（PCA 动作生成、关节限幅、平滑）与原 MIDI 路径完全一致。
+
+> **对比 MIDI 模式：** BPM-only 模式的动作由均匀节拍驱动，缺乏真实音乐的音高、力度变化与乐句起伏，因此动作规律性强、变化较少。适合快速原型验证、参数调试、或无合适 MIDI 时使用。
+
 ### 步骤 3：MuJoCo 可视化仿真
 
 ```bash
 # 运动学仿真（默认）：直接设定关节角度 + 脚底贴地 + CoM 平衡
 python midi_to_dance/simulate.py csv/output.csv mid/yellow_bass.mid
+
+# BPM-only 模式输出的 CSV（无 MIDI 音频源）：使用 --no-audio
+python midi_to_dance/simulate.py csv/bpm_output.csv --no-audio
 
 # 动力学仿真：PD 位置执行器 + 物理解算
 python midi_to_dance/simulate.py csv/output.csv mid/yellow_bass.mid --dynamics
@@ -253,10 +285,10 @@ timestamp,left_leg_pelvic_pitch,...,left_shoulder_pitch,...,right_wrist_roll
 midi_to_dance/
 ├── __init__.py
 ├── midi_parser.py           # mido 解析 MIDI → NoteEvent/MidiData（全轨道扫描）
-├── feature_extractor.py     # 音乐特征提取 (MusicalFeatures dataclass)
+├── feature_extractor.py     # 音乐特征提取 (MusicalFeatures + synthesize_features_from_bpm)
 ├── pca_extractor.py         # 高通去趋势 + 静止帧过滤 + 镜像增广 + SVD → pca_model.npz
 ├── pca_motion.py            # PCA 动作生成：连续载波 + 音乐调制 + 事件重音
-├── trajectory_generator.py  # 调用 pca_motion + 关节限位 clamp + 高斯平滑
+├── trajectory_generator.py  # 调用 pca_motion + 关节限位 clamp + 平滑 (MIDI / BPM-only 双入口)
 ├── trajectory_writer.py     # CSV 输出
 ├── main.py                  # CLI 入口 + matplotlib 可视化
 ├── motion_primitives.py     # 旧版手调基元 (已弃用，保留参考)
